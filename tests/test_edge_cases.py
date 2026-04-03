@@ -218,7 +218,7 @@ class TestCacheEdgeCases:
         values = mx.array(np.random.randn(1, 2, 50, 128).astype(np.float32))
         cache.update_and_fetch(keys, values)
         assert cache._compressed_len == 0
-        assert cache.keys.shape[2] == 50
+        assert cache._fp16_len == 50
 
     def test_zero_residual_window(self):
         """Window=0 means all tokens get compressed immediately."""
@@ -229,7 +229,7 @@ class TestCacheEdgeCases:
         k_out, v_out = cache.update_and_fetch(keys, values)
         mx.eval(k_out, v_out)
         assert cache._compressed_len == 10
-        assert cache.keys.shape[2] == 0
+        assert cache._fp16_len == 0
 
     def test_nbytes_increases_with_tokens(self):
         """Memory usage should grow with token count."""

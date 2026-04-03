@@ -94,7 +94,7 @@ class TestTurboQuantKVCacheBasic:
         mx.eval(cache.keys, cache.values)
 
         # FP16 buffer should only have `window` tokens
-        assert cache.keys.shape[2] == window
+        assert cache._fp16_len == window
         # Compressed storage should have the rest
         assert cache._compressed_len == 100 - window
 

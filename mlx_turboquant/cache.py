@@ -69,8 +69,10 @@ class TurboQuantKVCache:
             self.v_centroids, self.v_boundaries = get_codebook(head_dim, int(value_bits))
 
         # FP16 storage for recent tokens (residual window)
-        self.keys: Optional[mx.array] = None       # (B, H, T, D)
-        self.values: Optional[mx.array] = None      # (B, H, T, D)
+        self.keys: Optional[mx.array] = None       # (B, H, capacity, D) pre-allocated
+        self.values: Optional[mx.array] = None      # (B, H, capacity, D)
+        self._fp16_len: int = 0                     # valid tokens in FP16 buffer
+        self._fp16_capacity: int = 0                # allocated capacity
 
         # Compressed storage for older tokens
         # For integer bits: single packed array. For fractional: (packed_hi, packed_lo).
@@ -130,7 +132,7 @@ class TurboQuantKVCache:
         self._compressed_len = int(v["compressed_len"])
 
     def empty(self) -> bool:
-        return self.keys is None and self._compressed_len == 0
+        return self._fp16_len == 0 and self._compressed_len == 0
 
     def is_trimmable(self) -> bool:
         return False  # TurboQuant cache doesn't support trimming
@@ -141,8 +143,12 @@ class TurboQuantKVCache:
     @property
     def nbytes(self) -> int:
         total = 0
-        if self.keys is not None:
-            total += self.keys.nbytes + self.values.nbytes
+        if self.keys is not None and self._fp16_len > 0:
+            # Only count valid FP16 tokens, not pre-allocated capacity
+            elem_size = 4  # float32
+            D = self.head_dim
+            B, H = self.keys.shape[0], self.keys.shape[1]
+            total += 2 * B * H * self._fp16_len * D * elem_size  # keys + values
         if self._compressed_keys is not None:
             total += self._compressed_keys.nbytes + self._compressed_key_norms.nbytes
             total += self._compressed_values.nbytes + self._compressed_value_norms.nbytes
@@ -320,7 +326,7 @@ class TurboQuantKVCache:
         if self.keys is None:
             return
 
-        fp16_len = self.keys.shape[2]
+        fp16_len = self._fp16_len
         # Batch: only compress when we've accumulated a full window of excess
         compress_threshold = self.residual_window * 2
         if fp16_len <= compress_threshold:
@@ -329,8 +335,11 @@ class TurboQuantKVCache:
         n_compress = fp16_len - self.residual_window
         old_keys = self.keys[:, :, :n_compress, :]
         old_values = self.values[:, :, :n_compress, :]
-        self.keys = self.keys[:, :, n_compress:, :]
-        self.values = self.values[:, :, n_compress:, :]
+        # Shift remaining to front of pre-allocated buffer
+        remaining = fp16_len - n_compress
+        self.keys[:, :, :remaining, :] = self.keys[:, :, n_compress:fp16_len, :]
+        self.values[:, :, :remaining, :] = self.values[:, :, n_compress:fp16_len, :]
+        self._fp16_len = remaining
 
         # Compress keys and values
         pk_hi, pk_lo, nk, dk = self._compress_one_side(old_keys, is_key=True)
@@ -366,13 +375,35 @@ class TurboQuantKVCache:
         Returns:
             (all_keys, all_values) for attention computation, both in FP16/FP32
         """
-        # Append new tokens to FP16 buffer (simple concatenation)
+        # Append new tokens to FP16 buffer using pre-allocated window
         if self.keys is None:
-            self.keys = keys
-            self.values = values
+            # First call: pre-allocate with headroom
+            B, H, T_new, D = keys.shape
+            cap = max(T_new, self.residual_window * 2) + 256
+            self._fp16_capacity = cap
+            self._fp16_len = T_new
+            self.keys = mx.zeros((B, H, cap, D), dtype=keys.dtype)
+            self.values = mx.zeros((B, H, cap, D), dtype=values.dtype)
+            self.keys[:, :, :T_new, :] = keys
+            self.values[:, :, :T_new, :] = values
         else:
-            self.keys = mx.concatenate([self.keys, keys], axis=2)
-            self.values = mx.concatenate([self.values, values], axis=2)
+            T_new = keys.shape[2]
+            new_len = self._fp16_len + T_new
+            if new_len > self._fp16_capacity:
+                # Grow buffer (rare after initial prefill)
+                B, H, _, D = self.keys.shape
+                new_cap = new_len + 256
+                new_k = mx.zeros((B, H, new_cap, D), dtype=keys.dtype)
+                new_v = mx.zeros((B, H, new_cap, D), dtype=values.dtype)
+                new_k[:, :, :self._fp16_len, :] = self.keys[:, :, :self._fp16_len, :]
+                new_v[:, :, :self._fp16_len, :] = self.values[:, :, :self._fp16_len, :]
+                self.keys = new_k
+                self.values = new_v
+                self._fp16_capacity = new_cap
+            # Write new tokens in-place (no concat)
+            self.keys[:, :, self._fp16_len:self._fp16_len + T_new, :] = keys
+            self.values[:, :, self._fp16_len:self._fp16_len + T_new, :] = values
+            self._fp16_len = new_len
 
         self.offset += keys.shape[2]
 
@@ -393,11 +424,13 @@ class TurboQuantKVCache:
                 )
                 self._decompressed_valid = True
                 self._dequant_calls += 1
-            all_keys = mx.concatenate([self._decompressed_keys_cache, self.keys], axis=2)
-            all_values = mx.concatenate([self._decompressed_values_cache, self.values], axis=2)
+            fp16_keys = self.keys[:, :, :self._fp16_len, :]
+            fp16_values = self.values[:, :, :self._fp16_len, :]
+            all_keys = mx.concatenate([self._decompressed_keys_cache, fp16_keys], axis=2)
+            all_values = mx.concatenate([self._decompressed_values_cache, fp16_values], axis=2)
         else:
-            all_keys = self.keys
-            all_values = self.values
+            all_keys = self.keys[:, :, :self._fp16_len, :]
+            all_values = self.values[:, :, :self._fp16_len, :]
 
         return all_keys, all_values
 
