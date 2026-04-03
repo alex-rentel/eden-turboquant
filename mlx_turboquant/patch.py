@@ -90,7 +90,7 @@ def detect_outlier_layers(model: nn.Module, threshold: float = 3.0) -> list[int]
 
     # Run a short forward pass with standard cache
     cache = [KVCache() for _ in range(num_layers)]
-    dummy = mx.array([[1, 2, 3, 4, 5]])  # Short dummy input
+    dummy = mx.array([[0, 1, 2, 3, 4]])  # Token ID 0 is nearly always valid
     logits = model(dummy, cache=cache)
     mx.eval(logits)
 
