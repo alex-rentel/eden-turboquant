@@ -13,13 +13,22 @@ from .cache import TurboQuantKVCache
 
 def _get_model_config(model: nn.Module) -> dict:
     """Extract head_dim and num_kv_heads from model config."""
-    # Navigate to the inner model (e.g., model.model for LlamaForCausalLM)
+    # Navigate to the inner model — handle nested wrappers like
+    # Gemma3ForConditionalGeneration > language_model > model
     inner = getattr(model, "model", model)
 
-    # Try to get config from model args
-    args = getattr(inner, "args", None)
-    if args is None:
-        args = getattr(model, "args", None)
+    # Try multiple paths to find args (handles different model architectures)
+    args = None
+    for path in [
+        inner,                                          # model.model
+        model,                                          # model
+        getattr(model, "language_model", None),         # Gemma3 conditional
+        getattr(getattr(model, "language_model", None), "model", None),  # Gemma3 inner
+    ]:
+        if path is not None:
+            args = getattr(path, "args", None)
+            if args is not None and getattr(args, "hidden_size", None) is not None:
+                break
 
     if args is not None:
         # Standard mlx-lm config attributes
@@ -38,10 +47,14 @@ def _get_model_config(model: nn.Module) -> dict:
             num_kv_heads = getattr(args, "num_kv_heads", num_heads)
 
         if num_layers is None:
-            # Count layers
-            layers = getattr(inner, "layers", None)
-            if layers is not None:
-                num_layers = len(layers)
+            # Count layers — search multiple paths for nested architectures
+            for candidate in [inner, model, getattr(model, "language_model", None),
+                              getattr(getattr(model, "language_model", None), "model", None)]:
+                if candidate is not None:
+                    layers = getattr(candidate, "layers", None)
+                    if layers is not None and len(layers) > 0:
+                        num_layers = len(layers)
+                        break
 
         return {
             "head_dim": head_dim or 128,
