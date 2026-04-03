@@ -13,7 +13,6 @@ from typing import Optional
 
 import mlx.core as mx
 import numpy as np
-from scipy import special, integrate
 
 CODEBOOK_DIR = Path(__file__).parent / "codebooks"
 
@@ -26,6 +25,8 @@ def beta_pdf(x: np.ndarray, d: int) -> np.ndarray:
 
     This is Beta((d-1)/2, (d-1)/2) rescaled to [-1, 1].
     """
+    from scipy import special
+
     alpha = (d - 1) / 2.0
     # Normalization constant for Beta(alpha, alpha) on [-1, 1]
     log_norm = special.gammaln(2 * alpha) - 2 * special.gammaln(alpha) - (2 * alpha - 1) * math.log(2)
