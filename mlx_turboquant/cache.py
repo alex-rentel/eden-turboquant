@@ -30,8 +30,8 @@ class TurboQuantKVCache:
         self,
         head_dim: int = 128,
         num_kv_heads: int = 1,
-        key_bits: int = 4,
-        value_bits: int = 2,
+        key_bits: float = 4,
+        value_bits: float = 2,
         residual_window: int = 128,
         rotation_seed: int = 42,
     ):
@@ -45,18 +45,40 @@ class TurboQuantKVCache:
         # Gemma quality by >0.5%, see commit history)
         self.rotation = get_rotation_matrix(head_dim, rotation_seed)
 
-        # Codebooks
-        self.k_centroids, self.k_boundaries = get_codebook(head_dim, key_bits)
-        self.v_centroids, self.v_boundaries = get_codebook(head_dim, value_bits)
+        # Codebooks — for fractional bits (e.g. 3.5), store two codebooks
+        self._k_fractional = (key_bits != int(key_bits))
+        self._v_fractional = (value_bits != int(value_bits))
+
+        if self._k_fractional:
+            # e.g. 3.5 → first half at 4-bit, second half at 3-bit
+            self._k_bits_hi = int(key_bits) + 1  # 4
+            self._k_bits_lo = int(key_bits)       # 3
+            self.k_centroids_hi, self.k_boundaries_hi = get_codebook(head_dim, self._k_bits_hi)
+            self.k_centroids_lo, self.k_boundaries_lo = get_codebook(head_dim, self._k_bits_lo)
+            self.k_centroids = self.k_boundaries = None  # not used
+        else:
+            self.k_centroids, self.k_boundaries = get_codebook(head_dim, int(key_bits))
+
+        if self._v_fractional:
+            self._v_bits_hi = int(value_bits) + 1
+            self._v_bits_lo = int(value_bits)
+            self.v_centroids_hi, self.v_boundaries_hi = get_codebook(head_dim, self._v_bits_hi)
+            self.v_centroids_lo, self.v_boundaries_lo = get_codebook(head_dim, self._v_bits_lo)
+            self.v_centroids = self.v_boundaries = None
+        else:
+            self.v_centroids, self.v_boundaries = get_codebook(head_dim, int(value_bits))
 
         # FP16 storage for recent tokens (residual window)
         self.keys: Optional[mx.array] = None       # (B, H, T, D)
         self.values: Optional[mx.array] = None      # (B, H, T, D)
 
         # Compressed storage for older tokens
-        self._compressed_keys: Optional[mx.array] = None      # packed indices
-        self._compressed_key_norms: Optional[mx.array] = None  # float16 norms
-        self._compressed_values: Optional[mx.array] = None
+        # For integer bits: single packed array. For fractional: (packed_hi, packed_lo).
+        self._compressed_keys: Optional[mx.array] = None      # packed indices (or hi part)
+        self._compressed_keys_lo: Optional[mx.array] = None   # lo part (fractional only)
+        self._compressed_key_norms: Optional[mx.array] = None
+        self._compressed_values: Optional[mx.array] = None    # packed indices (or hi part)
+        self._compressed_values_lo: Optional[mx.array] = None # lo part (fractional only)
         self._compressed_value_norms: Optional[mx.array] = None
         self._compressed_len: int = 0
 
@@ -126,35 +148,75 @@ class TurboQuantKVCache:
             total += self._compressed_values.nbytes + self._compressed_value_norms.nbytes
         return total
 
-    def _quantize_kv(self, tensor: mx.array, centroids: mx.array,
-                     boundaries: mx.array, bits: int) -> tuple[mx.array, mx.array]:
-        """Quantize KV tensor: (B, H, T, D) -> (packed_indices, norms)."""
+    def _rotate_and_norm(self, tensor: mx.array) -> tuple[mx.array, mx.array, int]:
+        """Shared first step: cast, norm, normalize, rotate. Returns (rotated_flat, norms, N)."""
         B, H, T, D = tensor.shape
-
-        # Cast to float32 for norm computation (float16 overflows on large vectors)
         tensor_f32 = tensor.astype(mx.float32)
-
-        # Compute norms in float32
         norms = mx.linalg.norm(tensor_f32, axis=-1)  # (B, H, T)
         safe_norms = mx.maximum(norms, mx.array(1e-10))
+        normalized = tensor_f32 / safe_norms[..., None]
+        flat = normalized.reshape(-1, D)
+        rotated = rotate(flat, self.rotation)
+        return rotated, norms, B * H * T
 
-        # Normalize
-        normalized = tensor_f32 / safe_norms[..., None]  # (B, H, T, D)
+    def _quantize_kv(self, tensor: mx.array, centroids: mx.array,
+                     boundaries: mx.array, bits: float) -> tuple[mx.array, mx.array]:
+        """Quantize KV tensor: (B, H, T, D) -> (packed_indices, norms)."""
+        B, H, T, D = tensor.shape
+        rotated, norms, N = self._rotate_and_norm(tensor)
 
-        # Rotate: need to reshape for matmul
-        flat = normalized.reshape(-1, D)  # (B*H*T, D)
-        rotated = rotate(flat, self.rotation)  # (B*H*T, D)
-
-        # Quantize each coordinate
-        indices = quantize_scalar(rotated, centroids, boundaries)  # (B*H*T, D)
-
-        # Pack
-        packed = pack_indices(indices, bits)  # (B*H*T, packed_dim)
-        packed = packed.reshape(B, H, T, -1)
-
-        # Store norms as float32 (float16 overflows for models like Qwen
-        # with key norms > 65504; cost: 4 bytes vs 2 bytes per token per head)
+        indices = quantize_scalar(rotated, centroids, boundaries)
+        packed = pack_indices(indices, int(bits)).reshape(B, H, T, -1)
         return packed, norms
+
+    def _quantize_kv_fractional(self, tensor: mx.array,
+                                centroids_hi: mx.array, boundaries_hi: mx.array, bits_hi: int,
+                                centroids_lo: mx.array, boundaries_lo: mx.array, bits_lo: int,
+                                ) -> tuple[mx.array, mx.array, mx.array]:
+        """Quantize with fractional bits: first D/2 at bits_hi, second D/2 at bits_lo.
+
+        Returns (packed_hi, packed_lo, norms). Both packed arrays have T dimension.
+        """
+        B, H, T, D = tensor.shape
+        half_D = D // 2
+        rotated, norms, N = self._rotate_and_norm(tensor)
+
+        # Split rotated coordinates
+        rot_hi = rotated[:, :half_D]   # (N, D/2) — first half at higher bits
+        rot_lo = rotated[:, half_D:]   # (N, D/2) — second half at lower bits
+
+        idx_hi = quantize_scalar(rot_hi, centroids_hi, boundaries_hi)
+        idx_lo = quantize_scalar(rot_lo, centroids_lo, boundaries_lo)
+
+        packed_hi = pack_indices(idx_hi, bits_hi).reshape(B, H, T, -1)
+        packed_lo = pack_indices(idx_lo, bits_lo).reshape(B, H, T, -1)
+        return packed_hi, packed_lo, norms
+
+    def _dequantize_kv_fractional(self, packed_hi: mx.array, packed_lo: mx.array,
+                                  norms: mx.array,
+                                  centroids_hi: mx.array, bits_hi: int,
+                                  centroids_lo: mx.array, bits_lo: int) -> mx.array:
+        """Dequantize fractional-bit: two packed halves -> full vectors."""
+        B, H, T, _ = packed_hi.shape
+        D = self.head_dim
+        half_D = D // 2
+
+        # Unpack and dequantize each half
+        flat_hi = packed_hi.reshape(-1, packed_hi.shape[-1])
+        flat_lo = packed_lo.reshape(-1, packed_lo.shape[-1])
+        idx_hi = unpack_indices(flat_hi, bits_hi, half_D)
+        idx_lo = unpack_indices(flat_lo, bits_lo, half_D)
+        y_hi = dequantize_scalar(idx_hi, centroids_hi)
+        y_lo = dequantize_scalar(idx_lo, centroids_lo)
+
+        # Reassemble full rotated vector
+        y_hat = mx.concatenate([y_hi, y_lo], axis=-1)  # (N, D)
+
+        # Inverse rotate and scale
+        x_hat = inverse_rotate(y_hat, self.rotation)
+        flat_norms = norms.reshape(-1).astype(mx.float32)
+        x_hat = x_hat * flat_norms[:, None]
+        return x_hat.reshape(B, H, T, D)
 
     def _dequantize_kv(self, packed: mx.array, norms: mx.array,
                        centroids: mx.array, bits: int) -> mx.array:
@@ -189,72 +251,98 @@ class TurboQuantKVCache:
         x_hat = x_hat * flat_norms[:, None]
         return x_hat.reshape(B, H, T, D)
 
+    def _compress_one_side(self, old_tensor, is_key: bool):
+        """Compress one side (key or value) and return (packed_data, norms, decompressed)."""
+        fractional = self._k_fractional if is_key else self._v_fractional
+
+        if fractional:
+            bits_hi = self._k_bits_hi if is_key else self._v_bits_hi
+            bits_lo = self._k_bits_lo if is_key else self._v_bits_lo
+            c_hi = self.k_centroids_hi if is_key else self.v_centroids_hi
+            b_hi = self.k_boundaries_hi if is_key else self.v_boundaries_hi
+            c_lo = self.k_centroids_lo if is_key else self.v_centroids_lo
+            b_lo = self.k_boundaries_lo if is_key else self.v_boundaries_lo
+
+            packed_hi, packed_lo, norms = self._quantize_kv_fractional(
+                old_tensor, c_hi, b_hi, bits_hi, c_lo, b_lo, bits_lo,
+            )
+            decompressed = self._dequantize_kv_fractional(
+                packed_hi, packed_lo, norms, c_hi, bits_hi, c_lo, bits_lo,
+            )
+            return packed_hi, packed_lo, norms, decompressed
+        else:
+            bits = int(self.key_bits if is_key else self.value_bits)
+            centroids = self.k_centroids if is_key else self.v_centroids
+            boundaries = self.k_boundaries if is_key else self.v_boundaries
+
+            packed, norms = self._quantize_kv(old_tensor, centroids, boundaries, bits)
+            decompressed = self._dequantize_kv(packed, norms, centroids, bits)
+            return packed, None, norms, decompressed
+
+    def _append_compressed(self, packed_hi, packed_lo, norms, is_key: bool):
+        """Append packed data to compressed storage."""
+        if is_key:
+            if self._compressed_keys is None:
+                self._compressed_keys = packed_hi
+                self._compressed_keys_lo = packed_lo
+                self._compressed_key_norms = norms
+            else:
+                self._compressed_keys = mx.concatenate([self._compressed_keys, packed_hi], axis=2)
+                if packed_lo is not None:
+                    self._compressed_keys_lo = mx.concatenate(
+                        [self._compressed_keys_lo, packed_lo], axis=2
+                    ) if self._compressed_keys_lo is not None else packed_lo
+                self._compressed_key_norms = mx.concatenate(
+                    [self._compressed_key_norms, norms], axis=2
+                )
+        else:
+            if self._compressed_values is None:
+                self._compressed_values = packed_hi
+                self._compressed_values_lo = packed_lo
+                self._compressed_value_norms = norms
+            else:
+                self._compressed_values = mx.concatenate([self._compressed_values, packed_hi], axis=2)
+                if packed_lo is not None:
+                    self._compressed_values_lo = mx.concatenate(
+                        [self._compressed_values_lo, packed_lo], axis=2
+                    ) if self._compressed_values_lo is not None else packed_lo
+                self._compressed_value_norms = mx.concatenate(
+                    [self._compressed_value_norms, norms], axis=2
+                )
+
     def _compress_old_tokens(self):
         """Move tokens outside the residual window to compressed storage."""
         if self.keys is None:
             return
 
         fp16_len = self.keys.shape[2]
-
-        # Only compress if we have more FP16 tokens than the window allows
         if fp16_len <= self.residual_window:
             return
 
-        # How many tokens to compress
         n_compress = fp16_len - self.residual_window
-
-        # Split: old tokens to compress | recent tokens to keep in FP16
         old_keys = self.keys[:, :, :n_compress, :]
         old_values = self.values[:, :, :n_compress, :]
         self.keys = self.keys[:, :, n_compress:, :]
         self.values = self.values[:, :, n_compress:, :]
 
-        # Quantize old tokens
-        packed_k, norms_k = self._quantize_kv(
-            old_keys, self.k_centroids, self.k_boundaries, self.key_bits
-        )
-        packed_v, norms_v = self._quantize_kv(
-            old_values, self.v_centroids, self.v_boundaries, self.value_bits
-        )
+        # Compress keys and values
+        pk_hi, pk_lo, nk, dk = self._compress_one_side(old_keys, is_key=True)
+        pv_hi, pv_lo, nv, dv = self._compress_one_side(old_values, is_key=False)
 
-        # Append to compressed storage
-        if self._compressed_keys is None:
-            self._compressed_keys = packed_k
-            self._compressed_key_norms = norms_k
-            self._compressed_values = packed_v
-            self._compressed_value_norms = norms_v
-        else:
-            self._compressed_keys = mx.concatenate(
-                [self._compressed_keys, packed_k], axis=2
-            )
-            self._compressed_key_norms = mx.concatenate(
-                [self._compressed_key_norms, norms_k], axis=2
-            )
-            self._compressed_values = mx.concatenate(
-                [self._compressed_values, packed_v], axis=2
-            )
-            self._compressed_value_norms = mx.concatenate(
-                [self._compressed_value_norms, norms_v], axis=2
-            )
+        self._append_compressed(pk_hi, pk_lo, nk, is_key=True)
+        self._append_compressed(pv_hi, pv_lo, nv, is_key=False)
         self._compressed_len += n_compress
 
-        # Incrementally extend the decompressed cache instead of invalidating.
-        # Dequantize ONLY the newly compressed tokens and append.
-        new_decompressed_k = self._dequantize_kv(
-            packed_k, norms_k, self.k_centroids, self.key_bits,
-        )
-        new_decompressed_v = self._dequantize_kv(
-            packed_v, norms_v, self.v_centroids, self.value_bits,
-        )
+        # Incrementally extend decompressed cache
         if self._decompressed_keys_cache is None:
-            self._decompressed_keys_cache = new_decompressed_k
-            self._decompressed_values_cache = new_decompressed_v
+            self._decompressed_keys_cache = dk
+            self._decompressed_values_cache = dv
         else:
             self._decompressed_keys_cache = mx.concatenate(
-                [self._decompressed_keys_cache, new_decompressed_k], axis=2
+                [self._decompressed_keys_cache, dk], axis=2
             )
             self._decompressed_values_cache = mx.concatenate(
-                [self._decompressed_values_cache, new_decompressed_v], axis=2
+                [self._decompressed_values_cache, dv], axis=2
             )
         self._decompressed_valid = True
         self._dequant_calls += 1
