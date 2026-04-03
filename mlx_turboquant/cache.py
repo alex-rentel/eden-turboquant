@@ -59,6 +59,11 @@ class TurboQuantKVCache:
         self._compressed_value_norms: Optional[mx.array] = None
         self._compressed_len: int = 0
 
+        # Decompressed cache (avoids re-dequantizing every decode step)
+        self._decompressed_keys_cache: Optional[mx.array] = None
+        self._decompressed_values_cache: Optional[mx.array] = None
+        self._decompressed_valid: bool = False
+
         # Sequence offset (total tokens seen so far)
         self.offset: int = 0
 
@@ -218,6 +223,7 @@ class TurboQuantKVCache:
                 [self._compressed_value_norms, norms_v], axis=2
             )
         self._compressed_len += n_compress
+        self._decompressed_valid = False  # Invalidate decompression cache
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
@@ -231,55 +237,34 @@ class TurboQuantKVCache:
         Returns:
             (all_keys, all_values) for attention computation, both in FP16/FP32
         """
-        prev = self.offset
-
-        # Append new tokens to FP16 buffer
+        # Append new tokens to FP16 buffer (simple concatenation)
         if self.keys is None:
             self.keys = keys
             self.values = values
         else:
-            # Pre-allocate in chunks (like mlx-lm's KVCache)
-            B, H, T_new, D = keys.shape
-            T_existing = self.keys.shape[2]
-            T_total = T_existing + T_new
-            capacity = self.keys.shape[2]
-
-            if T_total > capacity:
-                # Need to grow
-                new_cap = T_total + self.step
-                new_k = mx.zeros((B, H, new_cap, D), dtype=keys.dtype)
-                new_v = mx.zeros((B, H, new_cap, D), dtype=values.dtype)
-                new_k[:, :, :T_existing, :] = self.keys[:, :, :T_existing, :]
-                new_v[:, :, :T_existing, :] = self.values[:, :, :T_existing, :]
-                self.keys = new_k
-                self.values = new_v
-                capacity = new_cap
-
-            # Write new tokens into the buffer
-            self.keys[:, :, T_existing:T_existing + T_new, :] = keys
-            self.values[:, :, T_existing:T_existing + T_new, :] = values
-
-            # Create views of valid data
-            self.keys = self.keys[:, :, :T_total, :]
-            self.values = self.values[:, :, :T_total, :]
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
 
         self.offset += keys.shape[2]
 
         # Compress old tokens if residual window is exceeded
         self._compress_old_tokens()
 
-        # Build full KV by dequantizing compressed + appending FP16 recent
+        # Build full KV using cached decompression (only re-decompresses
+        # when _compress_old_tokens actually moves tokens to compressed storage)
         if self._compressed_len > 0:
-            decompressed_keys = self._dequantize_kv(
-                self._compressed_keys, self._compressed_key_norms,
-                self.k_centroids, self.key_bits,
-            )
-            decompressed_values = self._dequantize_kv(
-                self._compressed_values, self._compressed_value_norms,
-                self.v_centroids, self.value_bits,
-            )
-            all_keys = mx.concatenate([decompressed_keys, self.keys], axis=2)
-            all_values = mx.concatenate([decompressed_values, self.values], axis=2)
+            if not self._decompressed_valid:
+                self._decompressed_keys_cache = self._dequantize_kv(
+                    self._compressed_keys, self._compressed_key_norms,
+                    self.k_centroids, self.key_bits,
+                )
+                self._decompressed_values_cache = self._dequantize_kv(
+                    self._compressed_values, self._compressed_value_norms,
+                    self.v_centroids, self.value_bits,
+                )
+                self._decompressed_valid = True
+            all_keys = mx.concatenate([self._decompressed_keys_cache, self.keys], axis=2)
+            all_values = mx.concatenate([self._decompressed_values_cache, self.values], axis=2)
         else:
             all_keys = self.keys
             all_values = self.values
