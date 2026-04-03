@@ -46,14 +46,19 @@ Tested on 4 real models across 2 architecture families (Qwen3: head_dim=128, Gem
 | Qwen3-8B | 302 MB | 101 MB | **3.0x** |
 | Gemma3-4B | 285 MB | 102 MB | **2.8x** |
 
-### Speed (2K context, decode)
+### Speed (decode, fused Metal kernels)
 
-| Model | Baseline | TurboQuant | Overhead |
-|-------|----------|------------|----------|
-| Qwen3-8B | 38.1 tok/s | 16.5 tok/s | 57% |
-| Gemma3-4B | 58.1 tok/s | 18.1 tok/s | 69% |
+| Model | Context | Baseline | TurboQuant | Overhead |
+|-------|---------|----------|------------|----------|
+| Qwen3-1.7B | 512 | 35.5 tok/s | 21.6 tok/s | 39% |
+| Qwen3-8B | 512 | 19.1 tok/s | 13.8 tok/s | 28% |
+| Qwen3-8B | 2K | 35.2 tok/s | 23.6 tok/s | 33% |
 
-Speed overhead is from software dequantization (dense rotation matrix multiply per token). See [Roadmap](#roadmap) for the Metal kernel plan.
+Fused Metal kernels (v0.3.0) reduced overhead from 57% to 28-33%.
+
+### Needle-in-a-Haystack
+
+Qwen3-8B K4/V2: **12/12 perfect** retrieval at 1K, 2K, 4K, 8K context — matches FP16 baseline.
 
 ## How It Works
 
@@ -74,8 +79,8 @@ TurboQuant implements both algorithms from the paper:
 ```python
 apply_turboquant(
     model,
-    key_bits=4,                # 2, 3, or 4 bits for keys
-    value_bits=2,              # 2, 3, or 4 bits for values
+    key_bits=4,                # 2, 3, 3.5, or 4 bits for keys
+    value_bits=2,              # 2, 3, 3.5, or 4 bits for values
     residual_window=128,       # recent tokens stay in FP16
     auto_detect_outliers=True, # skip layers with extreme key norms
     skip_layers=[0, 27],       # manually specify FP16 layers
@@ -120,7 +125,8 @@ Any model loaded via `mlx_lm.load()`. Tested on:
 |--------|--------------|----------|-------|
 | Qwen3 | 1.7B, 8B | 128 | Excellent quality, has outlier layers |
 | Gemma3 | 1B, 4B | 256 | Works well up to ~1K context |
-| Llama, Mistral, Phi | Expected compatible | 128 | Standard GQA, not yet benchmarked |
+| Llama 3.2 | 3B | 128 | Tested, coherent generation |
+| Mistral | 7B v0.3 | 128 | Tested, excellent quality (0.998 cos_sim) |
 
 ## Project Structure
 
@@ -156,7 +162,7 @@ python benchmarks/bench_speed.py
 
 ## Limitations
 
-1. **Decode speed overhead (57-69%):** The dense rotation matrix multiply (128×128 or 256×256) runs per token per head per layer during dequantization. Without fused Metal kernels, this dominates decode time. The value proposition today is fitting longer contexts in memory, not faster inference.
+1. **Decode speed overhead (28-39%):** Fused Metal kernels handle dequantization, but per-operation dispatch overhead from 70 `mx.concatenate` calls per step remains. A fused attention-from-compressed kernel would eliminate this.
 2. **Error compounding:** Per-vector reconstruction error (~0.5%) compounds through transformer layers. Models with more KV heads (Qwen3: 8 heads) are more robust than those with fewer (Gemma3-1B: 1 head).
 3. **Context-dependent compression:** At contexts shorter than `residual_window`, no compression occurs. Memory savings grow with context length.
 
@@ -164,13 +170,13 @@ python benchmarks/bench_speed.py
 
 ### v0.3.0 — Fused Metal Kernels
 
-The 57-69% decode overhead is entirely due to software dequantization — specifically the dense rotation matrix multiply that runs per token. The path to near-zero overhead:
+v0.3.0 shipped fused Metal dequantize kernels (57% -> 33% overhead). The remaining path to near-zero overhead:
 
-1. **Fused rotate+dequantize Metal kernel:** Combine centroid lookup + inverse rotation into a single Metal shader that operates directly on packed indices. This avoids materializing the full dequantized tensor in Python.
-2. **Fused attention-from-compressed kernel:** Compute attention scores directly from compressed KV representations without full dequantization. Another MLX TurboQuant implementation demonstrated 0.98x native speed with this approach.
-3. **Walsh-Hadamard fast path:** WHT rotation is O(d log d) vs O(d²) for QR. We tested WHT — it works for Qwen3 (head_dim=128) but degrades Gemma3 (head_dim=256) by 1.6%. A dimension-adaptive strategy could use WHT where safe and QR where needed.
+1. ~~**Fused rotate+dequantize Metal kernel**~~ — Done in v0.3.0. Reduced overhead from 57% to 33%.
+2. **Fused attention-from-compressed kernel:** Compute Q @ K^T directly from packed indices without materializing the full dequantized K tensor. This eliminates 70 concatenate ops per step. Another MLX TurboQuant implementation demonstrated 0.98x native speed with this approach.
+3. **Walsh-Hadamard fast path:** WHT is O(d log d) vs O(d²) for QR. Works for Qwen3 but degrades Gemma3 by 1.6%. Needs dimension-adaptive guard.
 
-Target: reduce decode overhead from 57-69% to under 15%.
+Target: reduce decode overhead from 33% to under 10%.
 
 ### Future
 
