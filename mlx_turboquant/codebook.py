@@ -168,7 +168,7 @@ def precompute_codebooks(
 
 
 def quantize_scalar(x: mx.array, centroids: mx.array, boundaries: mx.array) -> mx.array:
-    """Quantize values to nearest centroid index using boundaries.
+    """Quantize values to nearest centroid index using vectorized boundary comparison.
 
     Args:
         x: Values to quantize, any shape
@@ -178,14 +178,18 @@ def quantize_scalar(x: mx.array, centroids: mx.array, boundaries: mx.array) -> m
     Returns:
         Indices as uint8, same shape as x
     """
-    # Use searchsorted on boundaries to find bin indices
+    original_shape = x.shape
     flat = x.reshape(-1)
-    # boundaries is sorted, use comparison to find bin
-    # idx[i] = number of boundaries < flat[i]
-    indices = mx.zeros(flat.shape, dtype=mx.uint8)
-    for i in range(boundaries.shape[0]):
-        indices = mx.where(flat > boundaries[i], mx.array(i + 1, dtype=mx.uint8), indices)
-    return indices.reshape(x.shape)
+
+    # Vectorized: compare each value against all boundaries at once
+    # flat: (N,) -> (N, 1), boundaries: (B,) -> (1, B)
+    # comparisons: (N, B) boolean matrix
+    comparisons = flat[:, None] > boundaries[None, :]  # (N, num_boundaries)
+
+    # Sum across boundaries = index (number of boundaries exceeded)
+    indices = mx.sum(comparisons.astype(mx.uint8), axis=-1).astype(mx.uint8)  # (N,)
+
+    return indices.reshape(original_shape)
 
 
 def dequantize_scalar(indices: mx.array, centroids: mx.array) -> mx.array:
