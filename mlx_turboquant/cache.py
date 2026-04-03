@@ -63,6 +63,7 @@ class TurboQuantKVCache:
         self._decompressed_keys_cache: Optional[mx.array] = None
         self._decompressed_values_cache: Optional[mx.array] = None
         self._decompressed_valid: bool = False
+        self._dequant_calls: int = 0
 
         # Sequence offset (total tokens seen so far)
         self.offset: int = 0
@@ -224,7 +225,27 @@ class TurboQuantKVCache:
                 [self._compressed_value_norms, norms_v], axis=2
             )
         self._compressed_len += n_compress
-        self._decompressed_valid = False  # Invalidate decompression cache
+
+        # Incrementally extend the decompressed cache instead of invalidating.
+        # Dequantize ONLY the newly compressed tokens and append.
+        new_decompressed_k = self._dequantize_kv(
+            packed_k, norms_k, self.k_centroids, self.key_bits,
+        )
+        new_decompressed_v = self._dequantize_kv(
+            packed_v, norms_v, self.v_centroids, self.value_bits,
+        )
+        if self._decompressed_keys_cache is None:
+            self._decompressed_keys_cache = new_decompressed_k
+            self._decompressed_values_cache = new_decompressed_v
+        else:
+            self._decompressed_keys_cache = mx.concatenate(
+                [self._decompressed_keys_cache, new_decompressed_k], axis=2
+            )
+            self._decompressed_values_cache = mx.concatenate(
+                [self._decompressed_values_cache, new_decompressed_v], axis=2
+            )
+        self._decompressed_valid = True
+        self._dequant_calls += 1
 
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
@@ -264,6 +285,7 @@ class TurboQuantKVCache:
                     self.v_centroids, self.value_bits,
                 )
                 self._decompressed_valid = True
+                self._dequant_calls += 1
             all_keys = mx.concatenate([self._decompressed_keys_cache, self.keys], axis=2)
             all_values = mx.concatenate([self._decompressed_values_cache, self.values], axis=2)
         else:
