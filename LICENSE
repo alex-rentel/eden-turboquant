@@ -5,6 +5,11 @@ Copyright (c) 2026 Renaissance Intelligence
 TurboQuant algorithm by Amir Zandieh, Majid Daliri, Majid Hadian, Vahab Mirrokni
 (Google Research / Google DeepMind / NYU). arXiv:2504.19874, ICLR 2026.
 
+Community MLX implementations credited:
+- sharpner/turboquant-mlx
+- flovflo/turboquant-mlx-qwen35-kv
+- alicankiraz1/Qwen3.5-TurboQuant-MLX-LM
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

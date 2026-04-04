@@ -1,0 +1,10 @@
+hardware: "Apple M4 16GB"
+models:
+  - id: unsloth/gemma-4-E4B-it-UD-MLX-4bit
+    name: Gemma 4 E4B
+  - id: mlx-community/Qwen3-8B-4bit
+    name: Qwen 3 8B
+context_lengths: [2048, 4096, 8192]
+modes: [baseline, kv_quant, turboquant]
+runs_per_test: 3
+warmup_runs: 1

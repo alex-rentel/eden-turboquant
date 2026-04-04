@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check benchmarks/
+      - name: Format check
+        run: ruff format --check benchmarks/
+
+  test-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate test set
+        run: python -c "
+          import json;
+          tests = [json.loads(l) for l in open('benchmarks/tool_call_tests.jsonl') if l.strip()];
+          assert len(tests) == 50, f'Expected 50 tests, got {len(tests)}';
+          for t in tests:
+            assert 'id' in t and 'input' in t and 'expected' in t, f'Missing fields in test {t.get(\"id\", \"?\")}';
+            assert 'name' in t['expected'], f'Missing function name in test {t[\"id\"]}';
+          print(f'All {len(tests)} test cases valid')
+          "
+      - name: Validate configs
+        run: |
+          pip install pyyaml
+          python -c "
+          import yaml
+          for f in ['configs/m1_max_64gb.yaml', 'configs/m4_16gb.yaml']:
+            c = yaml.safe_load(open(f))
+            assert 'hardware' in c and 'models' in c and 'modes' in c
+            print(f'{f}: OK ({len(c[\"models\"])} models)')
+          "
+
+  # Tool-calling accuracy test on Apple Silicon runner (when available)
+  # Uncomment when self-hosted Apple Silicon runner is configured
+  # accuracy-test:
+  #   runs-on: [self-hosted, macOS, ARM64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Install dependencies
+  #       run: pip install -e .
+  #     - name: Run accuracy test (small model)
+  #       run: |
+  #         python benchmarks/tool_call_accuracy.py \
+  #           --model mlx-community/Qwen2.5-0.5B-Instruct-4bit \
+  #           --modes baseline \
+  #           --output results/ci_accuracy.json

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-turboquant"
-version = "0.5.0"
-description = "Near-optimal KV cache quantization for Apple Silicon using MLX"
+version = "1.0.0"
+description = "Benchmarking and integration layer for TurboQuant KV cache compression on Apple Silicon"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     {name = "Alexis Castellanos"},
 ]
-keywords = ["mlx", "quantization", "kv-cache", "llm", "apple-silicon"]
+keywords = ["mlx", "turboquant", "kv-cache", "benchmark", "apple-silicon", "tool-calling"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -27,29 +27,27 @@ classifiers = [
 dependencies = [
     "mlx>=0.20.0",
     "mlx-lm>=0.20.0",
-    "numpy>=1.24.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
-codebooks = ["scipy>=1.10.0"]
+turboquant = ["mlx-vlm>=0.1.0"]
 dev = [
     "pytest>=7.0",
-    "scipy>=1.10.0",
+    "ruff>=0.4.0",
 ]
+viz = ["matplotlib>=3.7.0"]
 
 [project.urls]
 Homepage = "https://github.com/alex-rentel/mlx-turboquant"
 Repository = "https://github.com/alex-rentel/mlx-turboquant"
 
-[project.scripts]
-mlx-turboquant = "mlx_turboquant.cli:main"
-
 [tool.setuptools.packages.find]
-include = ["mlx_turboquant*"]
-
-[tool.setuptools.package-data]
-mlx_turboquant = ["codebooks/*.npz"]
+include = ["benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["slow: marks tests that download and load real models"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
