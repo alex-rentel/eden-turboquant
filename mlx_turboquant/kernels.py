@@ -341,3 +341,208 @@ def metal_quantize_4bit(inp: mx.array, rotation: mx.array,
     )[0]
 
     return packed.reshape(N, half_D), norms
+
+
+# ============================================================
+# Fused QK Scores: Q_rot @ K_packed^T without dequantizing K
+# ============================================================
+#
+# Computes attention scores directly from packed codebook indices:
+#
+#     score[q, k] = norms_k[k] * sum_j( q_rot[q, j] * centroids[idx(k, j)] )
+#
+# where q_rot = Q @ R.T is the pre-rotated query (one matmul per step, cheap)
+# and idx(k, j) is the j-th codebook index for token k.
+#
+# This eliminates the per-step dequantize+matmul that dominates decode
+# overhead at v0.6.0. See docs/FUSED_ATTENTION_DESIGN.md for the math.
+#
+# Grid layout (Phase 2, correctness-first):
+#   (T_q * T_kv, 1, 1) — one thread per output score.
+#   Each thread iterates D centroid lookups serially. Phase 4 will add
+#   simd_sum + threadgroup shared memory for the D reduction.
+#
+# Inputs (all flat; mlx.fast.metal_kernel is row-contiguous by default):
+#   q_rot      : (T_q * D,)        float32
+#   packed_k   : (T_kv * packed_dim,) uint8
+#   norms_k    : (T_kv,)           float32
+#   centroids  : (2^bits,)         float32
+# Output:
+#   out        : (T_q * T_kv,)     float32
+
+_FUSED_QK_4BIT_SOURCE = """
+    // 2D grid: x = kv_idx, y = q_idx. T_kv and T_q are inferred from
+    // grid dimensions set on the Python side, so we don't need to read
+    // them from buffer metadata (Metal buffer pointers have no .size()).
+    uint kv_idx = thread_position_in_grid.x;
+    uint q_idx = thread_position_in_grid.y;
+    uint T_kv = threads_per_grid.x;
+
+    uint D_val = D;
+    uint half_D = D_val / 2;
+
+    float acc = 0.0f;
+    for (uint j = 0; j < D_val; j++) {
+        uint byte_idx = j >> 1;
+        uint packed_byte = packed_k[kv_idx * half_D + byte_idx];
+        uint idx;
+        if ((j & 1u) == 0u) {
+            idx = packed_byte & 0x0Fu;
+        } else {
+            idx = (packed_byte >> 4) & 0x0Fu;
+        }
+        float cent = centroids[idx];
+        acc += q_rot[q_idx * D_val + j] * cent;
+    }
+    out[q_idx * T_kv + kv_idx] = norms_k[kv_idx] * acc;
+"""
+
+_fused_qk_4bit_kernel = mx.fast.metal_kernel(
+    name="turboquant_fused_qk_4bit",
+    input_names=["q_rot", "packed_k", "norms_k", "centroids"],
+    output_names=["out"],
+    source=_FUSED_QK_4BIT_SOURCE,
+)
+
+_FUSED_QK_2BIT_SOURCE = """
+    uint kv_idx = thread_position_in_grid.x;
+    uint q_idx = thread_position_in_grid.y;
+    uint T_kv = threads_per_grid.x;
+
+    uint D_val = D;
+    uint quarter_D = D_val / 4;
+
+    float acc = 0.0f;
+    for (uint j = 0; j < D_val; j++) {
+        uint byte_idx = j >> 2;
+        uint shift = (j & 3u) * 2u;
+        uint packed_byte = packed_k[kv_idx * quarter_D + byte_idx];
+        uint idx = (packed_byte >> shift) & 0x03u;
+        float cent = centroids[idx];
+        acc += q_rot[q_idx * D_val + j] * cent;
+    }
+    out[q_idx * T_kv + kv_idx] = norms_k[kv_idx] * acc;
+"""
+
+_fused_qk_2bit_kernel = mx.fast.metal_kernel(
+    name="turboquant_fused_qk_2bit",
+    input_names=["q_rot", "packed_k", "norms_k", "centroids"],
+    output_names=["out"],
+    source=_FUSED_QK_2BIT_SOURCE,
+)
+
+# 3-bit packing: 8 values per 3 bytes. Same layout as _DEQUANT_3BIT_SOURCE
+# uses above — lifted directly.
+_FUSED_QK_3BIT_SOURCE = """
+    uint kv_idx = thread_position_in_grid.x;
+    uint q_idx = thread_position_in_grid.y;
+    uint T_kv = threads_per_grid.x;
+
+    uint D_val = D;
+    uint packed_stride = D_val * 3 / 8;
+
+    float acc = 0.0f;
+    for (uint j = 0; j < D_val; j++) {
+        uint group = j / 8;
+        uint pos = j % 8;
+        uint base = kv_idx * packed_stride + group * 3;
+        uint b0 = packed_k[base];
+        uint b1 = packed_k[base + 1];
+        uint b2 = packed_k[base + 2];
+
+        uint idx;
+        if (pos == 0)      idx = b0 & 0x07u;
+        else if (pos == 1) idx = (b0 >> 3) & 0x07u;
+        else if (pos == 2) idx = ((b0 >> 6) | (b1 << 2)) & 0x07u;
+        else if (pos == 3) idx = (b1 >> 1) & 0x07u;
+        else if (pos == 4) idx = (b1 >> 4) & 0x07u;
+        else if (pos == 5) idx = ((b1 >> 7) | (b2 << 1)) & 0x07u;
+        else if (pos == 6) idx = (b2 >> 2) & 0x07u;
+        else               idx = (b2 >> 5) & 0x07u;
+
+        float cent = centroids[idx];
+        acc += q_rot[q_idx * D_val + j] * cent;
+    }
+    out[q_idx * T_kv + kv_idx] = norms_k[kv_idx] * acc;
+"""
+
+_fused_qk_3bit_kernel = mx.fast.metal_kernel(
+    name="turboquant_fused_qk_3bit",
+    input_names=["q_rot", "packed_k", "norms_k", "centroids"],
+    output_names=["out"],
+    source=_FUSED_QK_3BIT_SOURCE,
+)
+
+
+def _dispatch_fused_qk(kernel, q_rot, packed_k, norms_k, centroids, D):
+    """Shared dispatch logic for the three bit-width variants.
+
+    Uses a 2D grid (T_kv, T_q, 1). Each thread computes one score at
+    position (q_idx, kv_idx). No division in the kernel, and T_kv is
+    read from Metal's ``threads_per_grid.x`` at runtime — so the
+    kernel compiles once per head_dim D, not once per (D, T_kv) pair.
+    """
+    T_q = q_rot.shape[0]
+    T_kv = packed_k.shape[0]
+
+    if T_kv == 0 or T_q == 0:
+        return mx.zeros((T_q, T_kv), dtype=mx.float32)
+
+    q_rot_f32 = q_rot.astype(mx.float32) if q_rot.dtype != mx.float32 else q_rot
+    norms_f32 = norms_k.astype(mx.float32) if norms_k.dtype != mx.float32 else norms_k
+    cent_f32 = centroids.astype(mx.float32) if centroids.dtype != mx.float32 else centroids
+
+    # 2D threadgroup: keep it 1D in the T_kv direction for SIMD-friendliness,
+    # since T_kv is typically the large axis (thousands of compressed tokens)
+    # and T_q is tiny (1 for decode, tens for prefill).
+    tg_x = min(256, T_kv)
+    tg_y = min(max(1, 256 // max(1, tg_x)), T_q)
+
+    result = kernel(
+        inputs=[q_rot_f32, packed_k, norms_f32, cent_f32],
+        output_shapes=[(T_q * T_kv,)],
+        output_dtypes=[mx.float32],
+        grid=(T_kv, T_q, 1),
+        threadgroup=(tg_x, tg_y, 1),
+        template=[("D", D)],
+    )
+    return result[0].reshape(T_q, T_kv)
+
+
+def fused_qk_scores_4bit(q_rot: mx.array, packed_k: mx.array,
+                         norms_k: mx.array, centroids: mx.array,
+                         D: int) -> mx.array:
+    """Fused Q @ K^T for 4-bit packed K — no dequantization materialized.
+
+    Args:
+        q_rot: Pre-rotated query vectors, shape (T_q, D) float32.
+               Obtain via ``pre_rotate_query(query, rotation)``.
+        packed_k: Packed 4-bit K indices, shape (T_kv, D/2) uint8.
+        norms_k: Per-token K norms, shape (T_kv,) float32.
+        centroids: Codebook centroids, shape (16,) float32.
+        D: Head dimension.
+
+    Returns:
+        Raw attention scores, shape (T_q, T_kv) float32. Pre-softmax,
+        pre-scale, pre-mask. The caller is responsible for softmax,
+        scaling, and causal masking — typically by combining these
+        scores with the FP16 region scores before the softmax.
+    """
+    return _dispatch_fused_qk(_fused_qk_4bit_kernel, q_rot, packed_k,
+                              norms_k, centroids, D)
+
+
+def fused_qk_scores_3bit(q_rot: mx.array, packed_k: mx.array,
+                         norms_k: mx.array, centroids: mx.array,
+                         D: int) -> mx.array:
+    """Fused Q @ K^T for 3-bit packed K."""
+    return _dispatch_fused_qk(_fused_qk_3bit_kernel, q_rot, packed_k,
+                              norms_k, centroids, D)
+
+
+def fused_qk_scores_2bit(q_rot: mx.array, packed_k: mx.array,
+                         norms_k: mx.array, centroids: mx.array,
+                         D: int) -> mx.array:
+    """Fused Q @ K^T for 2-bit packed K."""
+    return _dispatch_fused_qk(_fused_qk_2bit_kernel, q_rot, packed_k,
+                              norms_k, centroids, D)
