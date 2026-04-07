@@ -26,38 +26,46 @@ cache = model.make_cache()
 logits = model(inputs, cache=cache)
 ```
 
-## Benchmarks (M1 Max 64GB, April 2026)
+## Benchmarks (M1 Max 64GB, mlx 0.31.1)
 
-Tested on 4 real models across 2 architecture families (Qwen3: head_dim=128, Gemma3: head_dim=256).
+Full v0.6.0 numbers and methodology in [BENCHMARKS.md](BENCHMARKS.md). Highlights below.
 
-### Quality (cosine similarity vs FP16 baseline, ~500-token context)
+### Quality (cosine similarity vs FP16, ~1000-token prompt)
 
-| Model | head_dim | K4/V4 | K4/V2 | K3/V2 |
-|-------|----------|-------|-------|-------|
-| Qwen3-1.7B | 128 | 0.9914 | 0.9853 | 0.9687 |
-| Qwen3-8B | 128 | **0.9994** | 0.9976 | 0.9872 |
-| Gemma3-1B | 256 | 0.9953 | 0.9802 | 0.9619 |
-| Gemma3-4B | 256 | 0.9925 | 0.9848 | 0.9753 |
+| Model | head_dim | k4v2 | **k4v2 + sink128** | Δ from sink |
+|---|---|---|---|---|
+| Qwen3-1.7B-4bit | 128 | 0.9717 | **0.9749** | +0.0032 |
+| Qwen3-8B-4bit | 128 | 0.9938 | **0.9962** | +0.0024 |
+| Gemma3-1B-it-4bit | 256 | 0.7278 | 0.7284 | +0.0007 |
 
-### Memory (2K context, K4/V2)
+The new `fp16_sink_size=128` attention sink improves cosine similarity on every model tested with no measurable speed cost.
+
+### Memory (2K context, K4/V2 — carried from v0.5.0)
 
 | Model | Baseline | TurboQuant | Compression |
 |-------|----------|------------|-------------|
 | Qwen3-8B | 302 MB | 101 MB | **3.0x** |
 | Gemma3-4B | 285 MB | 102 MB | **2.8x** |
 
-### Speed (decode, K4/V2)
+### Speed (decode tok/s, k4v2 default)
 
 | Model | Context | Baseline | TurboQuant | Overhead |
-|-------|---------|----------|------------|----------|
-| Qwen3-1.7B | 512 | 35.5 tok/s | 29.8 tok/s | 16% |
-| Qwen3-8B | 2K | 41.3 tok/s | 36.7 tok/s | **11%** |
+|---|---|---|---|---|
+| Qwen3-1.7B-4bit | ~1K | 126.2 | 87.5 | ~22% |
+| Qwen3-8B-4bit | ~1K | 44.5 | 34.6 | ~22% |
+| Qwen3-8B-4bit | 2K (v0.5.0) | 41.3 | 36.7 | **11%** |
 
-Overhead reduced from 57% (v0.2.0, Python) → 33% (v0.3.0, Metal kernels) → **11%** (v0.5.0, batch compression + pre-allocated window).
+Overhead history: 57% (v0.2.0) → 33% (v0.3.0 Metal kernels) → **11%** (v0.5.0 batch compression at 2K context). v0.6.0 default decode path is identical to v0.5.0 (`chunk_size=0`); the per-context-length variation reflects amortization of per-step concat cost over longer attention work, not a regression.
 
-### Needle-in-a-Haystack
+### Needle-in-a-Haystack (Qwen3-8B-4bit, v0.6.0)
 
-Qwen3-8B K4/V2: **12/12 perfect** retrieval at 1K, 2K, 4K, 8K context — matches FP16 baseline.
+| Config | 1K | 2K | 4K | 8K | Total |
+|---|---|---|---|---|---|
+| FP16 baseline | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
+| k4v2 (v0.5.0 default) | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
+| k4v2 + sink128 | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
+
+Sink does not regress retrieval at any context length tested.
 
 ## How It Works
 
@@ -80,11 +88,33 @@ apply_turboquant(
     model,
     key_bits=4,                # 2, 3, 3.5, or 4 bits for keys
     value_bits=2,              # 2, 3, 3.5, or 4 bits for values
-    residual_window=128,       # recent tokens stay in FP16
+    residual_window=128,       # recent tokens stay in FP16 (sliding window)
     auto_detect_outliers=True, # skip layers with extreme key norms
     skip_layers=[0, 27],       # manually specify FP16 layers
+    # New in v0.6.0:
+    fp16_sink_size=128,        # permanent FP16 sink for first N tokens
+                               # (system prompt). Default 0 = disabled.
+                               # Improves cosine sim by +0.002 to +0.003
+                               # on Qwen3 family with no speed cost.
+    chunk_size=0,              # 0 (default) = v0.5.0 batch compression.
+                               # >0 enables fixed-size chunked draining.
+                               # Opt in for future kernel work; benchmark-
+                               # neutral with current Metal kernels.
+    qjl_correction=False,      # EXPERIMENTAL. 1-bit QJL sign-sketch
+                               # residual correction. Helps Qwen3-8B
+                               # (+0.0017 cos sim) but HURTS Qwen3-1.7B
+                               # (-0.0052). Default OFF.
+    qjl_n_proj=32,             # QJL projection rank (when correction on).
 )
 ```
+
+### When to enable `fp16_sink_size`
+
+Enable for tool-calling, JSON-mode extraction, or any workflow where the
+first 64-256 tokens carry critical schema or instruction tokens you want
+to preserve bit-exactly. The cost is `fp16_sink_size * 2 * head_dim *
+num_kv_heads * 4 bytes` per layer of additional FP16 memory — typically
+under 5 MB total even for large models.
 
 You can also use the low-level quantizer directly:
 
@@ -142,7 +172,8 @@ mlx_turboquant/
   cli.py          # Command-line interface
   codebooks/      # Precomputed Lloyd-Max codebooks (.npz)
 benchmarks/       # Quality, memory, speed, needle-in-haystack benchmarks
-tests/            # 137 unit tests + 1 integration test with real model
+                  # bench_v06.py + needle_haystack_v06.py for v0.6.0 sweep
+tests/            # 157 unit tests + 1 integration test with real model
 ```
 
 ## Running Tests
@@ -176,6 +207,7 @@ python benchmarks/bench_speed.py
 | v0.3.0 | Fused Metal dequantize kernels | 57% → 33% overhead |
 | v0.4.0 | 3.5-bit fractional, needle-in-haystack, PyPI packaging | 12/12 retrieval at 1K-8K |
 | v0.5.0 | Batch compression + pre-allocated FP16 window | 33% → **11%** overhead |
+| **v0.6.0** | Attention sink + QJL correction + state-reload fixes | **+0.003 cos_sim**, 12/12 needle preserved |
 
 ### Next: Fused Attention-from-Compressed Kernel
 
