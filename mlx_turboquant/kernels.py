@@ -561,3 +561,157 @@ def fused_qk_scores_2bit(q_rot: mx.array, packed_k: mx.array,
     """Fused Q @ K^T for 2-bit packed K."""
     return _dispatch_fused_qk(_fused_qk_2bit_kernel, q_rot, packed_k,
                               norms_k, centroids, D)
+
+
+# ============================================================
+# Batched fused QK scores: (B, H, T_q, D) @ (B, H_kv, T_kv, D/2)
+# ============================================================
+#
+# v0.8.0 integration kernel. The v0.7.0 kernel (_fused_qk_4bit_kernel
+# above) operates on a single (T_q, D) query / (T_kv, D/2) packed_k
+# pair. For per-layer integration in the SDPA hot path we need to
+# process all batches and heads in a single Metal dispatch to avoid
+# per-head dispatch overhead killing the win.
+#
+# Grid: (T_kv, T_q, B * H)   — H is the QUERY head count
+# Each thread computes one score at position (b, h, q, kv).
+# GQA mapping: kv_head = h / (H / H_KV).
+#
+# Shapes (all row-contiguous, flat device buffers):
+#   q_rot      : (B, H, T_q, D)            float32
+#   packed_k   : (B, H_KV, T_kv, D/2)      uint8
+#   norms_k    : (B, H_KV, T_kv)           float32
+#   centroids  : (16,)                     float32
+# Output:
+#   out        : (B, H, T_q, T_kv)         float32
+#
+# Template parameters: D (head dim), H (query heads), H_KV (KV heads).
+# One compile per (D, H, H_KV) combination — for a given model this
+# is a single compile.
+
+_FUSED_QK_4BIT_BATCHED_SOURCE = """
+    uint kv_idx = thread_position_in_grid.x;
+    uint q_idx  = thread_position_in_grid.y;
+    uint bh_idx = thread_position_in_grid.z;
+
+    uint T_kv = threads_per_grid.x;
+    uint T_q  = threads_per_grid.y;
+    uint D_val = D;
+    uint half_D = D_val / 2;
+    uint H_val = H;
+    uint H_KV_val = H_KV;
+    uint H_per_kv = H_val / H_KV_val;
+
+    uint b = bh_idx / H_val;
+    uint h = bh_idx - b * H_val;
+    uint kv_head = h / H_per_kv;
+
+    // Threadgroup-shared codebook for this tile.
+    threadgroup float shared_centroids[16];
+    uint local_id =
+        (thread_position_in_threadgroup.z * threads_per_threadgroup.y
+         + thread_position_in_threadgroup.y) * threads_per_threadgroup.x
+        + thread_position_in_threadgroup.x;
+    uint local_size =
+        threads_per_threadgroup.x * threads_per_threadgroup.y
+        * threads_per_threadgroup.z;
+    for (uint i = local_id; i < 16; i += local_size) {
+        shared_centroids[i] = centroids[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Base offsets into each input buffer.
+    // q_rot row:     [b, h, q_idx, 0..D)
+    uint q_base = ((b * H_val + h) * T_q + q_idx) * D_val;
+    // packed_k row:  [b, kv_head, kv_idx, 0..half_D)
+    uint k_base = ((b * H_KV_val + kv_head) * T_kv + kv_idx) * half_D;
+    // norm scalar:   [b, kv_head, kv_idx]
+    uint norm_idx = (b * H_KV_val + kv_head) * T_kv + kv_idx;
+
+    float acc = 0.0f;
+    for (uint j = 0; j < D_val; j++) {
+        uint byte_idx = j >> 1;
+        uint packed_byte = packed_k[k_base + byte_idx];
+        uint idx;
+        if ((j & 1u) == 0u) {
+            idx = packed_byte & 0x0Fu;
+        } else {
+            idx = (packed_byte >> 4) & 0x0Fu;
+        }
+        float cent = shared_centroids[idx];
+        acc += q_rot[q_base + j] * cent;
+    }
+
+    uint out_idx = ((b * H_val + h) * T_q + q_idx) * T_kv + kv_idx;
+    out[out_idx] = norms_k[norm_idx] * acc;
+"""
+
+_fused_qk_4bit_batched_kernel = mx.fast.metal_kernel(
+    name="turboquant_fused_qk_4bit_batched",
+    input_names=["q_rot", "packed_k", "norms_k", "centroids"],
+    output_names=["out"],
+    source=_FUSED_QK_4BIT_BATCHED_SOURCE,
+)
+
+
+def fused_qk_scores_4bit_batched(
+    q_rot: mx.array,      # (B, H, T_q, D) float32
+    packed_k: mx.array,   # (B, H_kv, T_kv, D/2) uint8
+    norms_k: mx.array,    # (B, H_kv, T_kv) float32
+    centroids: mx.array,  # (16,) float32
+    D: int,
+    H: int,
+    H_kv: int,
+) -> mx.array:
+    """Batched fused Q @ K^T for 4-bit packed K with GQA support.
+
+    Computes per-layer attention scores in a single Metal dispatch for
+    all (batch, head, query_token, kv_token) combinations.
+
+    GQA mapping: kv_head = query_head // (H / H_kv). H must be divisible
+    by H_kv.
+
+    Args:
+        q_rot: Pre-rotated query, shape (B, H, T_q, D) float32.
+        packed_k: Packed 4-bit K indices, shape (B, H_kv, T_kv, D/2) uint8.
+        norms_k: Per-token K norms, shape (B, H_kv, T_kv) float32.
+        centroids: Codebook centroids, shape (16,) float32.
+        D: Head dimension.
+        H: Number of query heads.
+        H_kv: Number of KV heads (H_kv must divide H).
+
+    Returns:
+        Attention scores, shape (B, H, T_q, T_kv) float32.
+    """
+    if H % H_kv != 0:
+        raise ValueError(f"H ({H}) must be divisible by H_kv ({H_kv})")
+
+    B = q_rot.shape[0]
+    assert q_rot.shape[1] == H, f"q_rot head dim mismatch: {q_rot.shape[1]} vs {H}"
+    T_q = q_rot.shape[2]
+    assert q_rot.shape[3] == D
+    assert packed_k.shape[0] == B
+    assert packed_k.shape[1] == H_kv
+    T_kv = packed_k.shape[2]
+
+    if T_kv == 0 or T_q == 0:
+        return mx.zeros((B, H, T_q, T_kv), dtype=mx.float32)
+
+    q_rot_f32 = q_rot.astype(mx.float32) if q_rot.dtype != mx.float32 else q_rot
+    norms_f32 = norms_k.astype(mx.float32) if norms_k.dtype != mx.float32 else norms_k
+    cent_f32 = centroids.astype(mx.float32) if centroids.dtype != mx.float32 else centroids
+
+    # 3D threadgroup: favor the T_kv axis for SIMD-friendly coalescing.
+    tg_x = min(32, T_kv)
+    tg_y = min(max(1, 256 // tg_x), T_q)
+    tg_z = min(max(1, 256 // (tg_x * tg_y)), B * H)
+
+    result = _fused_qk_4bit_batched_kernel(
+        inputs=[q_rot_f32, packed_k, norms_f32, cent_f32],
+        output_shapes=[(B * H * T_q * T_kv,)],
+        output_dtypes=[mx.float32],
+        grid=(T_kv, T_q, B * H),
+        threadgroup=(tg_x, tg_y, tg_z),
+        template=[("D", D), ("H", H), ("H_KV", H_kv)],
+    )
+    return result[0].reshape(B, H, T_q, T_kv)

@@ -138,10 +138,14 @@ def _quantize_k_for_test(k_vectors, bits, d):
 
 def _dequantize_k_for_test(ctx, d, bits):
     """Reference dequantization path — same as cache._dequantize_kv but
-    flat, for test use only."""
+    flat, for test use only. Accepts norms of any shape; returns
+    dequantized K in flat (N, D) form."""
     from mlx_turboquant.kernels import metal_dequantize
+    norms = ctx["norms"]
+    # Flatten norms to (N,) for metal_dequantize
+    norms_flat = norms.reshape(-1)
     return metal_dequantize(
-        ctx["packed"], ctx["norms"], ctx["centroids"], ctx["rotation"],
+        ctx["packed"], norms_flat, ctx["centroids"], ctx["rotation"],
         bits=bits, d=d,
     )
 
@@ -257,6 +261,98 @@ class TestFusedQKScoresCorrectness3Bit:
 
     def test_prefill(self):
         self._run_and_compare(T_q=4, T_kv=128, d=128)
+
+
+class TestFusedQKScoresBatched4Bit:
+    """Phase v0.8.0: batched fused kernel for per-layer integration.
+
+    The batched kernel takes (B, H, T_q, D) and (B, H_kv, T_kv, D/2)
+    inputs with GQA support. Correctness guarantee: for each
+    (batch, head, query_token) triple, the output must match
+    Q[b,h,q] @ K_hat[b, kv_head(h), :, :].T to within atol=1e-3.
+    """
+
+    def _build_inputs(self, B, H, H_kv, T_q, T_kv, D):
+        """Build random Q, quantize K, return arrays ready for both
+        the batched kernel and the reference path."""
+        np.random.seed(B * 10000 + H * 100 + T_q * 10 + T_kv)
+
+        # Q: random (B, H, T_q, D)
+        Q = mx.array(np.random.randn(B, H, T_q, D).astype(np.float32))
+
+        # K: random (B, H_kv, T_kv, D), then quantize each (H_kv, T_kv, D) slab
+        K = mx.array(np.random.randn(B, H_kv, T_kv, D).astype(np.float32) * 2.0)
+
+        ctx = _quantize_k_for_test(K, bits=4, d=D)
+        # The helper flattens to (B*H_kv*T_kv, D) internally — norms/packed
+        # come back flat. Reshape to (B, H_kv, T_kv, *) for the batched path.
+        packed = ctx["packed"]  # (B*H_kv*T_kv, D/2) — needs reshape
+        norms = ctx["norms"]     # (B, H_kv, T_kv)
+        # Quantize helper returned norms already in (B, H_kv, T_kv) because
+        # norm is computed along axis=-1 on the original (B, H_kv, T_kv, D)
+        # tensor. Packed needs reshape: it's (-1, D/2) currently.
+        packed_4d = packed.reshape(B, H_kv, T_kv, D // 2)
+
+        K_dequant_flat = _dequantize_k_for_test(ctx, d=D, bits=4)
+        K_dequant = K_dequant_flat.reshape(B, H_kv, T_kv, D)
+
+        return Q, packed_4d, norms, ctx["centroids"], ctx["rotation"], K_dequant
+
+    def _reference(self, Q, K_dequant, H, H_kv):
+        """Reference Q @ K^T with GQA head broadcasting."""
+        # Q shape (B, H, T_q, D); K shape (B, H_kv, T_kv, D)
+        # Broadcast K from H_kv to H
+        H_per_kv = H // H_kv
+        # (B, H_kv, T_kv, D) -> repeat each kv head H_per_kv times -> (B, H, T_kv, D)
+        K_broadcast = mx.repeat(K_dequant, H_per_kv, axis=1)
+        return Q @ K_broadcast.transpose(0, 1, 3, 2)
+
+    def _run(self, B, H, H_kv, T_q, T_kv, D):
+        from mlx_turboquant.kernels import fused_qk_scores_4bit_batched
+
+        Q, packed, norms, centroids, rotation, K_dequant = self._build_inputs(
+            B, H, H_kv, T_q, T_kv, D,
+        )
+        reference = self._reference(Q, K_dequant, H, H_kv)
+
+        Q_rot = pre_rotate_query(Q, rotation)
+        fused = fused_qk_scores_4bit_batched(
+            Q_rot, packed, norms, centroids, D=D, H=H, H_kv=H_kv,
+        )
+
+        _materialize(reference, fused)
+        assert fused.shape == reference.shape, \
+            f"shape mismatch {fused.shape} vs {reference.shape}"
+
+        np.testing.assert_allclose(
+            np.array(fused), np.array(reference), atol=1e-3, rtol=1e-3,
+            err_msg=f"batched fused != reference at B={B} H={H} H_kv={H_kv} "
+                    f"T_q={T_q} T_kv={T_kv} D={D}",
+        )
+
+    def test_qwen3_decode(self):
+        """Qwen3-8B shape: B=1, H=32, H_kv=8, T_q=1, T_kv=1024, D=128"""
+        self._run(B=1, H=32, H_kv=8, T_q=1, T_kv=1024, D=128)
+
+    def test_qwen3_decode_long(self):
+        """Qwen3-8B long context: T_kv=4096"""
+        self._run(B=1, H=32, H_kv=8, T_q=1, T_kv=4096, D=128)
+
+    def test_llama_decode(self):
+        """Llama-3.1-8B shape: same GQA ratio as Qwen3"""
+        self._run(B=1, H=32, H_kv=8, T_q=1, T_kv=1024, D=128)
+
+    def test_no_gqa(self):
+        """Mistral-7B style: H == H_kv (no broadcasting needed)."""
+        self._run(B=1, H=8, H_kv=8, T_q=1, T_kv=512, D=128)
+
+    def test_prefill_shape(self):
+        """Prefill: multiple query tokens."""
+        self._run(B=1, H=32, H_kv=8, T_q=8, T_kv=256, D=128)
+
+    def test_batch_size_2(self):
+        """Basic batched inputs."""
+        self._run(B=2, H=16, H_kv=4, T_q=1, T_kv=256, D=128)
 
 
 class TestFusedQKScoresCorrectness2Bit:
