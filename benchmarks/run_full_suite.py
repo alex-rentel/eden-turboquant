@@ -118,11 +118,19 @@ def build_prompt(tokenizer, target_tokens):
 
 
 def get_make_cache(model, cfg):
-    """Build the make_cache callable for the given config dict."""
+    """Build the make_cache callable for the given config dict.
+
+    Uses auto_detect_outliers=True to match the library default that a
+    user gets from `apply_turboquant(model)`. Outlier detection makes a
+    dramatic difference at short contexts (~500 tokens) on models like
+    Qwen2.5-7B and Qwen3-8B — without it those models can drop to
+    cos_sim 0.46 on a 500-token prompt because their extreme-norm
+    layers dominate the per-layer compression error.
+    """
     if cfg["type"] == "fp16":
         return lambda: make_prompt_cache(model)
     kw = {k: v for k, v in cfg.items() if k not in ("name", "type")}
-    apply_turboquant(model, **kw, auto_detect_outliers=False)
+    apply_turboquant(model, **kw, auto_detect_outliers=True)
     return model.make_cache
 
 
