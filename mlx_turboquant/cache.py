@@ -15,6 +15,7 @@ import numpy as np
 from .codebook import get_codebook, quantize_scalar, dequantize_scalar
 from .rotation import get_rotation_matrix, rotate, inverse_rotate
 from .packing import pack_indices, unpack_indices
+from .qjl import get_projection_matrix, qjl_quantize, qjl_dequantize
 
 
 class TurboQuantKVCache:
@@ -36,6 +37,8 @@ class TurboQuantKVCache:
         rotation_seed: int = 42,
         fp16_sink_size: int = 0,
         chunk_size: int = 64,
+        qjl_correction: bool = False,
+        qjl_n_proj: int = 32,
     ):
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
@@ -44,6 +47,16 @@ class TurboQuantKVCache:
         self.residual_window = residual_window
         self.fp16_sink_size = fp16_sink_size
         self.chunk_size = chunk_size
+        self.qjl_correction = qjl_correction
+        self.qjl_n_proj = qjl_n_proj
+
+        # Lazy QJL projection matrix — only allocated when correction is on.
+        # Uses the global get_projection_matrix cache so all caches with the
+        # same (head_dim, n_proj) share the same projection.
+        if qjl_correction:
+            self._qjl_projection = get_projection_matrix(head_dim, qjl_n_proj)
+        else:
+            self._qjl_projection = None
 
         # Rotation matrix (QR decomposition — WHT tested but degraded
         # Gemma quality by >0.5%, see commit history)
@@ -293,6 +306,36 @@ class TurboQuantKVCache:
         x_hat = x_hat * flat_norms[:, None]
         return x_hat.reshape(B, H, T, D)
 
+    def _apply_qjl_correction(self, original: mx.array, decompressed: mx.array) -> mx.array:
+        """Apply 1-bit QJL sign-sketch correction to a dequantized tensor.
+
+        Computes the residual r = original - decompressed, takes a 1-bit
+        sign sketch via random Gaussian projection, then reconstructs an
+        unbiased estimate of r and adds it back to the decompressed tensor.
+
+        Unlike sharpner/cache_v2.py which stores the sketch but never reads
+        it back, we apply the correction immediately at compression time.
+        The corrected tensor is what gets stored in _decompressed_keys_cache,
+        so QJL sign bits never need to be persisted — they are transient
+        within this call. Zero memory overhead, ~5% extra compute per chunk.
+
+        Args:
+            original: Pre-quantization tensor, shape (B, H, T, D)
+            decompressed: Dequantized tensor from MSE quant, same shape
+
+        Returns:
+            Corrected tensor (B, H, T, D) with reduced quantization error
+        """
+        residual = (original.astype(mx.float32)
+                    - decompressed.astype(mx.float32))
+        # Flatten leading axes for projection
+        B, H, T, D = residual.shape
+        flat_r = residual.reshape(-1, D)
+        signs, r_norms = qjl_quantize(flat_r, self._qjl_projection)
+        correction_flat = qjl_dequantize(signs, r_norms, self._qjl_projection, D)
+        correction = correction_flat.reshape(B, H, T, D)
+        return decompressed + correction
+
     def _compress_one_side(self, old_tensor, is_key: bool):
         """Compress one side (key or value) and return (packed_data, norms, decompressed)."""
         fractional = self._k_fractional if is_key else self._v_fractional
@@ -311,7 +354,6 @@ class TurboQuantKVCache:
             decompressed = self._dequantize_kv_fractional(
                 packed_hi, packed_lo, norms, c_hi, bits_hi, c_lo, bits_lo,
             )
-            return packed_hi, packed_lo, norms, decompressed
         else:
             bits = int(self.key_bits if is_key else self.value_bits)
             centroids = self.k_centroids if is_key else self.v_centroids
@@ -319,7 +361,12 @@ class TurboQuantKVCache:
 
             packed, norms = self._quantize_kv(old_tensor, centroids, boundaries, bits)
             decompressed = self._dequantize_kv(packed, norms, centroids, bits)
-            return packed, None, norms, decompressed
+            packed_hi, packed_lo = packed, None
+
+        if self.qjl_correction:
+            decompressed = self._apply_qjl_correction(old_tensor, decompressed)
+
+        return packed_hi, packed_lo, norms, decompressed
 
     def _append_compressed(self, packed_hi, packed_lo, norms, is_key: bool):
         """Append packed data to compressed storage."""

@@ -174,6 +174,83 @@ class TestTurboQuantKVCacheBasic:
             assert k_out.shape == (1, 2, 20, d)
 
 
+class TestQJLCorrection:
+    """Tests for optional 1-bit QJL sign-sketch residual correction."""
+
+    def test_qjl_disabled_by_default(self):
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2)
+        assert cache.qjl_correction is False
+        assert cache._qjl_projection is None
+
+    def test_qjl_projection_allocated_when_enabled(self):
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  qjl_correction=True, qjl_n_proj=32)
+        assert cache._qjl_projection is not None
+        assert cache._qjl_projection.shape == (32, 128)
+
+    def test_qjl_correction_reduces_dequant_error(self):
+        """QJL-corrected dequantization should have lower MSE than uncorrected.
+
+        Uses identical inputs and only flips the qjl_correction flag, so
+        any difference is purely the correction effect.
+        """
+        np.random.seed(0)
+        # Use a tensor that will have meaningful quantization error
+        keys_np = np.random.randn(1, 4, 200, 128).astype(np.float32)
+        keys = mx.array(keys_np)
+
+        # 2-bit values force significant quant error so the correction
+        # has something meaningful to fix.
+        cache_off = TurboQuantKVCache(head_dim=128, key_bits=2, value_bits=2,
+                                       residual_window=8, chunk_size=64,
+                                       qjl_correction=False)
+        cache_on = TurboQuantKVCache(head_dim=128, key_bits=2, value_bits=2,
+                                      residual_window=8, chunk_size=64,
+                                      qjl_correction=True, qjl_n_proj=32)
+
+        cache_off.update_and_fetch(keys, keys)
+        cache_on.update_and_fetch(keys, keys)
+
+        # Compare decompressed cache content (the compressed portion)
+        deq_off = np.array(cache_off._decompressed_keys_cache)
+        deq_on = np.array(cache_on._decompressed_keys_cache)
+
+        # Both should have the same shape
+        assert deq_off.shape == deq_on.shape
+        n_compressed = deq_off.shape[2]
+        truth = keys_np[:, :, :n_compressed, :]
+
+        mse_off = float(np.mean((deq_off - truth) ** 2))
+        mse_on = float(np.mean((deq_on - truth) ** 2))
+
+        # QJL correction should reduce MSE (allow tiny tolerance for noise)
+        assert mse_on < mse_off, (
+            f"QJL correction did not reduce MSE: off={mse_off:.6f}, on={mse_on:.6f}"
+        )
+
+    def test_qjl_does_not_affect_sink_or_residual(self):
+        """QJL correction only touches compressed chunks, not sink or residual."""
+        np.random.seed(1)
+        keys_np = np.random.randn(1, 2, 200, 128).astype(np.float32)
+        keys = mx.array(keys_np)
+
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=16, chunk_size=64,
+                                  fp16_sink_size=8, qjl_correction=True)
+        k_out, _ = cache.update_and_fetch(keys, keys)
+
+        # Sink should still be bit-exact
+        np.testing.assert_array_equal(
+            np.array(k_out[:, :, :8, :]), keys_np[:, :, :8, :]
+        )
+        # Residual region (last cache._fp16_len tokens) should also be bit-exact
+        residual_start = k_out.shape[2] - cache._fp16_len
+        np.testing.assert_array_equal(
+            np.array(k_out[:, :, residual_start:, :]),
+            keys_np[:, :, residual_start:, :],
+        )
+
+
 class TestChunkedCompression:
     """Tests for fixed-size chunk_size compression draining."""
 

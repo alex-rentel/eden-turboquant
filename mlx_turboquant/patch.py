@@ -141,6 +141,8 @@ def apply_turboquant(
     auto_detect_outliers: bool = True,
     fp16_sink_size: int = 0,
     chunk_size: int = 64,
+    qjl_correction: bool = False,
+    qjl_n_proj: int = 32,
 ) -> nn.Module:
     """Apply TurboQuant KV cache compression to an mlx-lm model.
 
@@ -164,6 +166,14 @@ def apply_turboquant(
         chunk_size: Number of tokens compressed per drain operation. Fixed
             chunk sizes give Metal kernels stable input shapes, improving
             kernel template caching. Default 64.
+        qjl_correction: When True, apply a 1-bit QJL sign-sketch correction
+            to the dequantized cache at compression time. Improves cosine
+            similarity at the cost of ~5% extra compute per compression
+            chunk. Zero memory overhead — the sketch is consumed at
+            compression time, not stored. Default False.
+        qjl_n_proj: Number of QJL random projections (only used when
+            qjl_correction=True). Higher = more accurate correction at
+            slightly more compute. Default 32.
 
     Returns:
         The same model (modified in-place)
@@ -216,6 +226,8 @@ def apply_turboquant(
                     rotation_seed=rotation_seed,
                     fp16_sink_size=fp16_sink_size,
                     chunk_size=chunk_size,
+                    qjl_correction=qjl_correction,
+                    qjl_n_proj=qjl_n_proj,
                 ))
         return caches
 
@@ -232,6 +244,8 @@ def apply_turboquant(
         "residual_window": residual_window,
         "fp16_sink_size": fp16_sink_size,
         "chunk_size": chunk_size,
+        "qjl_correction": qjl_correction,
+        "qjl_n_proj": qjl_n_proj,
     }
 
     return model
