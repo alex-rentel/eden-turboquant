@@ -274,7 +274,7 @@ The v0.7.0 kernels are shipped as utilities — they are NOT yet automatically u
 
 ## Limitations
 
-1. **Decode overhead at long context (22-36% at 2K).** Decompression cost scales with cache size. The fused QK kernel (v0.7.0) achieves 2.12x speedup in isolation but is not yet integrated into the SDPA path — end-to-end decode overhead is unchanged from v0.6.0 until v0.8.0 ships the per-family attention patches.
+1. **Decode overhead at long context (22-36% at 2K).** Decompression cost scales with cache size. The fused QK kernel (v0.7.0) achieves 2.12x speedup vs dequant+matmul in isolation but does NOT integrate cleanly into the end-to-end decode path: competing against `mx.fast.scaled_dot_product_attention` (a hyper-optimized single fused kernel) via a decomposed Q@K + softmax + V matmul sequence turns out to be slower, not faster. The experimental integration lives on `feat/fused-sdpa-qwen3` as a documented negative result; full details and next-step plan in [docs/FUSED_SDPA_RESULTS.md](docs/FUSED_SDPA_RESULTS.md). A proper fix requires writing a full fused attention kernel (Q@K^T + softmax + weighted sum over V, all in one dispatch, on packed KV) — deferred to v0.9.0.
 2. **Error compounding.** Per-vector reconstruction error compounds through layers. Models with fewer KV heads (Gemma3-1B: 1 head) are more fragile.
 3. **Qwen3.5 partial coverage.** Only 8/32 layers use self-attention; memory savings are proportionally smaller.
 4. **Quality depends on outlier detection.** Disabling `auto_detect_outliers` drops Qwen2.5-7B from 0.80 → 0.46 cos_sim at K4/V2.
