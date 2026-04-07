@@ -224,18 +224,30 @@ python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 2
 | v0.4.0 | 3.5-bit fractional, needle-in-haystack, PyPI packaging | 12/12 retrieval at 1K-8K |
 | v0.5.0 | Batch compression, pre-allocated FP16 window | 33% → **11%** decode overhead |
 | **v0.6.0** | Attention sink, hybrid attention, QJL correction, 12-model sweep | **+0.098 cos_sim** on Qwen3-8B, 12 models × 8 families validated |
+| **v0.7.0** | Fused QK scores Metal kernel (4/3/2-bit) + `pre_rotate_query` utility | **2.12× speedup** on long-context decode (T_kv=4096 D=128) vs dequant+matmul. See [BENCHMARKS_v07.md](BENCHMARKS_v07.md). |
 
 ## Next Steps
 
-### v0.7.0 — Metal Kernel Improvements
+### v0.7.0 shipped — fused QK scores kernel
 
-The competitive audit ([docs/COMPETITIVE_AUDIT.md](docs/COMPETITIVE_AUDIT.md)) identified three optimizations deferred from v0.6.0:
+The fused attention-from-compressed kernel landed in v0.7.0 as a first-class utility (`mlx_turboquant.kernels.fused_qk_scores_{4,3,2}bit`). Correctness is guaranteed by a 12-test suite matching the existing dequant+matmul path to `atol=1e-3` across all bit widths, head_dims 96/128/256, and decode/prefill shapes. Micro-benchmark wins:
 
-- **Shared-memory WHT in quantize kernel.** Move Walsh-Hadamard from per-thread to threadgroup shared memory with butterfly barriers. Reduces quantize latency.
-- **SIMD reductions in dequant kernel.** Replace scalar accumulation with `simd_sum` for the inverse-rotation dot product. ~2x speedup on the inner loop.
-- **Fused attention-from-compressed kernel.** Compute Q @ K^T directly from packed indices without materializing dequantized K. Would drop decode overhead from 11-36% to near zero. arozanov/turboquant-mlx claims 0.98x native speed with this approach but benchmarks are unverified.
+- decode T_kv=4096 D=128: **2.12×** speedup
+- decode T_kv=1024 D=256 (Gemma3-like): **2.03×** speedup
+- decode T_kv=1024 D=128: **1.42×** speedup
+- prefill and short-context decode: roughly tied (dispatch-bound regime)
 
-### v0.8.0 — Long Context Validation
+See [docs/FUSED_ATTENTION_DESIGN.md](docs/FUSED_ATTENTION_DESIGN.md) for the math derivation and [BENCHMARKS_v07.md](BENCHMARKS_v07.md) for the full micro-benchmark.
+
+### v0.8.0 — Full SDPA integration + long-context validation
+
+The v0.7.0 kernels are shipped as utilities — they are NOT yet automatically used by `apply_turboquant`. Integration requires per-model-family attention patches (Llama, Qwen, Mistral, Gemma, Phi, DeepSeek each have slightly different `self_attn.__call__` implementations). That work is v0.8.0:
+
+- **Per-family attention patches.** Replace the SDPA call with a custom path that uses the fused kernel for the compressed region and standard matmul for sink + residual.
+- **SIMD reductions in the fused kernel inner loop.** Replace the serial D-element accumulation with `simd_sum` for an additional ~30-50% speedup.
+- **Other deferred optimizations.** Shared-memory WHT in the quantize kernel (from v0.6.0 competitive audit).
+
+### v0.9.0 — Long Context Validation
 
 - Needle-in-haystack at 16K, 32K, 64K context (current tests go to 8K)
 - Benchmark on Qwen3.5-35B-A3B (MoE) and Llama-3.1-70B

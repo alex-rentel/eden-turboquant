@@ -2,6 +2,92 @@
 
 All notable changes to mlx-turboquant.
 
+## [0.7.0] — 2026-04-07
+
+### Added
+
+- **Fused QK scores Metal kernel** — three new Metal kernels that
+  compute `Q_rot @ K^T` directly from packed codebook indices, without
+  materializing dequantized K. Eliminates the per-token inverse
+  rotation that dominates v0.6.0 decode overhead.
+  - `mlx_turboquant.kernels.fused_qk_scores_4bit(q_rot, packed_k, norms_k, centroids, D)`
+  - `mlx_turboquant.kernels.fused_qk_scores_3bit(...)`
+  - `mlx_turboquant.kernels.fused_qk_scores_2bit(...)`
+  - Micro-benchmark on M1 Max 64GB vs dequant+matmul baseline:
+    - decode T_kv=4096 D=128: **2.12×** speedup
+    - decode T_kv=1024 D=256 (Gemma3-like): **2.03×** speedup
+    - decode T_kv=1024 D=128: 1.42× speedup
+    - prefill is roughly tied (dispatch-bound regime)
+  - Full benchmark methodology in `BENCHMARKS_v07.md`.
+  - Correctness guarantee: identical to dequant+matmul to atol=1e-3 on
+    random inputs across all tested shapes. 12 tests in
+    `TestFusedQKScoresCorrectness{4,3,2}Bit`.
+
+- **`pre_rotate_query(query, rotation)` utility** in `mlx_turboquant.rotation`.
+  The key insight that makes the fused kernel possible: because we store
+  `K = norms * (centroids[idx] @ R)`, the dot product `Q . K` simplifies
+  to `norms * (Q @ R.T) . centroids[idx]`. Pre-rotating Q once per decode
+  step eliminates the `D×D` inverse rotation per compressed token inside
+  the attention inner loop. 5 tests in `TestPreRotateQueryMath`.
+
+- **`docs/FUSED_ATTENTION_DESIGN.md`** — design doc covering:
+  - Math derivation for the `Q @ R.T . centroids` identity
+  - Kernel thread/threadgroup layout
+  - Memory layout of inputs/outputs
+  - Honest analysis of the integration blocker (mlx-lm's SDPA call
+    accepts only dense tensors; intercepting it requires per-family
+    attention patches)
+  - Three considered integration approaches (A: per-family patch,
+    B: custom cache method, C: utility-only — shipped in v0.7.0)
+  - Numerical considerations (float32 inside kernel, rotation
+    orientation, packing layout)
+  - What's deferred to v0.8.0 (fusing V, SDPA integration, simd_sum
+    D-reduction)
+
+- **Phase 4 optimization: threadgroup shared centroids** in the 4-bit
+  fused kernel. The 16 codebook centroids are loaded into
+  `threadgroup float shared_centroids[16]` once per threadgroup, then
+  every thread reads from shared memory instead of global memory during
+  the D-element inner loop. Added +0.17 speedup at T_kv=4096.
+
+- **`benchmarks/micro_fused_qk.py`** — go/no-go micro-benchmark that
+  times the fused path against dequant+matmul on 7 realistic shapes.
+
+- **`BENCHMARKS_v07.md`** — full speedup numbers, kernel architecture
+  notes, and the honest "what isn't shipped in v0.7.0" section.
+
+### Not in v0.7.0 (deferred to v0.8.0)
+
+- **Full SDPA integration.** The fused kernels are shipped as
+  first-class utilities but are NOT automatically used by
+  `apply_turboquant`. `TurboQuantKVCache.update_and_fetch` still returns
+  dense FP16 tensors that feed into standard
+  `mx.fast.scaled_dot_product_attention`. Users who want the speedup
+  today must call the kernels manually in a custom attention loop —
+  see the integration pathway in `BENCHMARKS_v07.md`.
+- **Fusing V.** The current work covers only the Q @ K^T side of
+  attention; the softmax-weighted V accumulation still uses dequantized
+  V. Fusing V requires either a two-pass kernel or online softmax.
+- **`simd_sum` D-reduction.** The current kernel has one thread per
+  output score with a serial D-element inner loop. A SIMD-width
+  reduction would split D across 32 lanes per SIMD group.
+
+### Changed
+
+- No behavior changes in existing code paths. `TurboQuantKVCache`,
+  `apply_turboquant`, and all v0.6.0 features are byte-identical to
+  v0.6.0 when the fused kernel is not invoked. v0.6.0 → v0.7.0 is
+  strictly additive.
+
+### Tests
+
+- 17 new tests in `tests/test_fused_attention.py`:
+  - 5 `TestPreRotateQueryMath` (Phase 1)
+  - 8 `TestFusedQKScoresCorrectness4Bit` (Phase 2)
+  - 2 `TestFusedQKScoresCorrectness3Bit`
+  - 2 `TestFusedQKScoresCorrectness2Bit`
+- Full test count: **175** (158 previous + 17 new). All passing.
+
 ## [0.6.0] — 2026-04-07
 
 ### Added
