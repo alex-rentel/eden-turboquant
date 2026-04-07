@@ -1,0 +1,112 @@
+# Model registry for benchmarks/run_full_suite.py
+# Three tiers:
+#   tier 1 — primary 7B-8B models, the main event
+#   tier 2 — smaller / regression-grade models
+#   tier 3 — experimental (Bonsai 1-bit, optional)
+
+models:
+  # === Tier 1: Primary 7B-9B models ===
+  - id: mlx-community/Qwen3-8B-4bit
+    name: Qwen3-8B
+    tier: 1
+    notes: "Best 8B all-rounder, head_dim=128, GQA"
+
+  - id: mlx-community/Qwen3.5-9B-4bit
+    name: Qwen3.5-9B
+    tier: 1
+    notes: "Hybrid attention (linear+self_attn), key architecture test"
+
+  - id: mlx-community/DeepSeek-R1-0528-Qwen3-8B-4bit
+    name: DeepSeek-R1-Qwen3-8B
+    tier: 1
+    notes: "Reasoning model, long CoT generation = long KV cache"
+
+  - id: mlx-community/Meta-Llama-3.1-8B-Instruct-4bit
+    name: Llama-3.1-8B
+    tier: 1
+    notes: "GQA architecture, different KV head count"
+
+  - id: mlx-community/Mistral-7B-Instruct-v0.3-4bit
+    name: Mistral-7B
+    tier: 1
+    notes: "Sliding window attention, edge case for residual window"
+
+  - id: mlx-community/Qwen2.5-7B-Instruct-4bit
+    name: Qwen2.5-7B
+    tier: 1
+    notes: "Previous-gen Qwen, validates backward compat"
+
+  - id: mlx-community/Phi-3.5-mini-instruct-4bit
+    name: Phi-3.5-mini
+    tier: 1
+    notes: "Microsoft, different architecture family"
+
+  # === Tier 2: Smaller models, fast regression coverage ===
+  - id: mlx-community/Qwen3-4B-4bit
+    name: Qwen3-4B
+    tier: 2
+    notes: "Mid-size Qwen"
+
+  - id: mlx-community/Qwen3-1.7B-4bit
+    name: Qwen3-1.7B
+    tier: 2
+    notes: "Small, fast, good for quick iteration"
+
+  - id: mlx-community/Llama-3.2-3B-Instruct-4bit
+    name: Llama-3.2-3B
+    tier: 2
+    notes: "Small Llama"
+
+  - id: mlx-community/gemma-3-4b-it-4bit
+    name: Gemma3-4B
+    tier: 2
+    notes: "head_dim=256, fewer KV heads, stress test for outlier detection"
+
+  - id: mlx-community/gemma-3-1b-it-4bit
+    name: Gemma3-1B
+    tier: 2
+    notes: "1 KV head, minimum viable. Auto-upgrades to K4/V3"
+
+  # === Tier 3: Experimental ===
+  - id: prism-ml/Bonsai-8B-mlx-1bit
+    name: Bonsai-8B
+    tier: 3
+    notes: "1-bit weights, requires PrismML MLX fork. Skip if fork breaks core deps."
+
+# Benchmark parameters
+quality:
+  prompt_tokens: 500          # target context length for cosine sim test
+
+speed:
+  prompt_lengths: [256, 2048] # measure decode at these prefill sizes
+  decode_tokens: 50           # tokens decoded per timed run
+  warmup_runs: 1
+  timed_runs: 3
+
+memory:
+  context_lengths: [512, 1024, 2048, 4096]
+
+ttft:
+  prompt_lengths: [256, 2048]
+
+# TurboQuant configurations to test per model
+configs:
+  - name: baseline
+    type: fp16
+  - name: K4/V4
+    type: tq
+    key_bits: 4
+    value_bits: 4
+  - name: K4/V2
+    type: tq
+    key_bits: 4
+    value_bits: 2
+  - name: K4/V2+sink128
+    type: tq
+    key_bits: 4
+    value_bits: 2
+    fp16_sink_size: 128
+  - name: K3/V2
+    type: tq
+    key_bits: 3
+    value_bits: 2

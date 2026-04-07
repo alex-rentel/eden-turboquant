@@ -1,0 +1,266 @@
+[
+  {
+    "id": "mlx-community/Qwen3-0.6B-4bit",
+    "ok": true,
+    "load_seconds": 0.6683981250098441,
+    "model_class": "Model",
+    "inner_class": "Qwen3Model",
+    "num_layers": 28,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 16,
+    "hidden_size": 1024,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.030682625001645647,
+    "logits_shape": [
+      1,
+      4,
+      151936
+    ],
+    "logits_dtype": "mlx.core.bfloat16"
+  },
+  {
+    "id": "mlx-community/Qwen3-1.7B-4bit",
+    "ok": true,
+    "load_seconds": 0.5419692080031382,
+    "model_class": "Model",
+    "inner_class": "Qwen3Model",
+    "num_layers": 28,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 16,
+    "hidden_size": 2048,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.03043279099802021,
+    "logits_shape": [
+      1,
+      4,
+      151936
+    ],
+    "logits_dtype": "mlx.core.bfloat16"
+  },
+  {
+    "id": "mlx-community/Qwen3-4B-4bit",
+    "ok": true,
+    "load_seconds": 0.7362419590062927,
+    "model_class": "Model",
+    "inner_class": "Qwen3Model",
+    "num_layers": 36,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 32,
+    "hidden_size": 2560,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.054317208006978035,
+    "logits_shape": [
+      1,
+      4,
+      151936
+    ],
+    "logits_dtype": "mlx.core.bfloat16"
+  },
+  {
+    "id": "mlx-community/Qwen3-8B-4bit",
+    "ok": true,
+    "load_seconds": 1.1708057079958962,
+    "model_class": "Model",
+    "inner_class": "Qwen3Model",
+    "num_layers": 36,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 32,
+    "hidden_size": 4096,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.08397766700363718,
+    "logits_shape": [
+      1,
+      4,
+      151936
+    ],
+    "logits_dtype": "mlx.core.bfloat16"
+  },
+  {
+    "id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "ok": true,
+    "load_seconds": 0.47390166600234807,
+    "model_class": "Model",
+    "inner_class": "Qwen2Model",
+    "num_layers": 28,
+    "head_dim": 128,
+    "num_kv_heads": 4,
+    "num_attention_heads": 28,
+    "hidden_size": 3584,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.10499016699031927,
+    "logits_shape": [
+      1,
+      4,
+      152064
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "ok": true,
+    "load_seconds": 0.7907256670005154,
+    "model_class": "Model",
+    "inner_class": "LlamaModel",
+    "num_layers": 16,
+    "head_dim": 64,
+    "num_kv_heads": 8,
+    "num_attention_heads": 32,
+    "hidden_size": 2048,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.0506325000023935,
+    "logits_shape": [
+      1,
+      5,
+      128256
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+    "ok": true,
+    "load_seconds": 0.9415210830047727,
+    "model_class": "Model",
+    "inner_class": "LlamaModel",
+    "num_layers": 28,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 24,
+    "hidden_size": 3072,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.03856504199211486,
+    "logits_shape": [
+      1,
+      5,
+      128256
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/gemma-2-2b-it-4bit",
+    "ok": true,
+    "load_seconds": 0.957567375007784,
+    "model_class": "Model",
+    "inner_class": "GemmaModel",
+    "num_layers": 26,
+    "head_dim": 256,
+    "num_kv_heads": 4,
+    "num_attention_heads": 8,
+    "hidden_size": 2304,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.04508758400334045,
+    "logits_shape": [
+      1,
+      5,
+      256000
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/gemma-3-1b-it-4bit",
+    "ok": true,
+    "load_seconds": 1.1671814579895,
+    "model_class": "Model",
+    "inner_class": "Gemma3Model",
+    "num_layers": 26,
+    "head_dim": 256,
+    "num_kv_heads": 1,
+    "num_attention_heads": 4,
+    "hidden_size": 1152,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.04690087500785012,
+    "logits_shape": [
+      1,
+      5,
+      262144
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/gemma-3-4b-it-4bit",
+    "ok": true,
+    "load_seconds": 1.428569374998915,
+    "model_class": "Model",
+    "inner_class": "Model",
+    "num_layers": 34,
+    "head_dim": null,
+    "num_kv_heads": null,
+    "num_attention_heads": null,
+    "hidden_size": null,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.18088712501048576,
+    "logits_shape": [
+      1,
+      5,
+      262208
+    ],
+    "logits_dtype": "mlx.core.bfloat16"
+  },
+  {
+    "id": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+    "ok": true,
+    "load_seconds": 0.7786810830002651,
+    "model_class": "Model",
+    "inner_class": "LlamaModel",
+    "num_layers": 32,
+    "head_dim": 128,
+    "num_kv_heads": 8,
+    "num_attention_heads": 32,
+    "hidden_size": 4096,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.06898758400348015,
+    "logits_shape": [
+      1,
+      5,
+      32768
+    ],
+    "logits_dtype": "mlx.core.float16"
+  },
+  {
+    "id": "mlx-community/Phi-3.5-mini-instruct-4bit",
+    "ok": true,
+    "load_seconds": 0.478828582999995,
+    "model_class": "Model",
+    "inner_class": "Phi3Model",
+    "num_layers": 32,
+    "head_dim": 96,
+    "num_kv_heads": 32,
+    "num_attention_heads": 32,
+    "hidden_size": 3072,
+    "layer_attention_types": [
+      "self_attn"
+    ],
+    "forward_seconds": 0.061489500003517605,
+    "logits_shape": [
+      1,
+      4,
+      32064
+    ],
+    "logits_dtype": "mlx.core.float16"
+  }
+]
