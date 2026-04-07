@@ -238,43 +238,42 @@ python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 2
 | v0.5.0 | Batch compression, pre-allocated FP16 window | 33% → **11%** decode overhead |
 | **v0.6.0** | Attention sink, hybrid attention, QJL correction, 12-model sweep | **+0.098 cos_sim** on Qwen3-8B, 12 models × 8 families validated |
 | **v0.7.0** | Fused QK scores Metal kernel (4/3/2-bit) + `pre_rotate_query` utility | **2.12× speedup** on long-context decode (T_kv=4096 D=128) vs dequant+matmul. See [BENCHMARKS_v07.md](BENCHMARKS_v07.md). |
+| v0.8.0 *(branch)* | Decomposed SDPA integration — fused QK + separate softmax + V matmul | Correct (cos_sim=1.0) but **0.61x-0.99x** vs `mx.fast.sdpa`. [Post-mortem](docs/FUSED_SDPA_RESULTS.md). Branch: `feat/fused-sdpa-qwen3` |
+| v0.9.0 *(branch)* | Full single-dispatch fused attention kernel (online softmax + packed K/V) | Correct (5/5 tests) but **0.64x-0.86x** vs `mx.fast.sdpa`. [Analysis](docs/FULL_FUSED_ATTENTION_RESULTS.md). Branch: `feat/full-fused-attention` |
 
 ## Next Steps
 
-### v0.7.0 shipped — fused QK scores kernel
+### What We Tried (and Why It Didn't Ship)
 
-The fused attention-from-compressed kernel landed in v0.7.0 as a first-class utility (`mlx_turboquant.kernels.fused_qk_scores_{4,3,2}bit`). Correctness is guaranteed by a 12-test suite matching the existing dequant+matmul path to `atol=1e-3` across all bit widths, head_dims 96/128/256, and decode/prefill shapes. Micro-benchmark wins:
+The fused QK scores kernel (v0.7.0) beats dequant+matmul 2.12x in isolation. We made two attempts to turn that into end-to-end decode speedups — both produced correct results but failed to beat `mx.fast.scaled_dot_product_attention`:
 
-- decode T_kv=4096 D=128: **2.12×** speedup
-- decode T_kv=1024 D=256 (Gemma3-like): **2.03×** speedup
-- decode T_kv=1024 D=128: **1.42×** speedup
-- prefill and short-context decode: roughly tied (dispatch-bound regime)
+**v0.8.0 attempt — Decomposed SDPA** ([`feat/fused-sdpa-qwen3`](https://github.com/alex-rentel/mlx-turboquant/tree/feat/fused-sdpa-qwen3)). Replaced the SDPA call with fused QK for compressed K + standard matmul for sink/residual K + separate softmax + V matmul. Result: **0.61x-0.99x vs standard path** — decomposing one hyper-optimized dispatch into 6-7 separate dispatches added more overhead than the per-op speedup saved. Correctness was perfect (cos_sim = 1.000000). Full post-mortem in [docs/FUSED_SDPA_RESULTS.md](docs/FUSED_SDPA_RESULTS.md).
 
-See [docs/FUSED_ATTENTION_DESIGN.md](docs/FUSED_ATTENTION_DESIGN.md) for the math derivation and [BENCHMARKS_v07.md](BENCHMARKS_v07.md) for the full micro-benchmark.
+**v0.9.0 attempt — Full single-dispatch fused kernel** ([`feat/full-fused-attention`](https://github.com/alex-rentel/mlx-turboquant/tree/feat/full-fused-attention)). Wrote a complete Metal kernel (online softmax + simd_sum + GQA + packed K and V in one dispatch), modeled on sharpner's `_FUSED_ATTN_NOROT_SOURCE`. Result: **0.64x-0.86x vs `mx.fast.sdpa`** — our kernel runs at 57x its theoretical memory-bandwidth limit while Apple's runs at 4.4x. The centroid indirection (data-dependent gather per lane per token) kills the bandwidth advantage of smaller packed data. Correctness was perfect (5/5 tests, atol<2e-3). Full analysis in [docs/FULL_FUSED_ATTENTION_RESULTS.md](docs/FULL_FUSED_ATTENTION_RESULTS.md).
 
-### v0.8.0 — Full SDPA integration + long-context validation
+Both branches are preserved with full test suites (186 tests passing) and benchmark harnesses. The infrastructure (SDPA dispatch, cache state accessors, GQA-aware batched kernels) is reusable for future attempts.
 
-The v0.7.0 kernels are shipped as utilities — they are NOT yet automatically used by `apply_turboquant`. Integration requires per-model-family attention patches (Llama, Qwen, Mistral, Gemma, Phi, DeepSeek each have slightly different `self_attn.__call__` implementations). That work is v0.8.0:
+### What Could Actually Win
 
-- **Per-family attention patches.** Replace the SDPA call with a custom path that uses the fused kernel for the compressed region and standard matmul for sink + residual.
-- **SIMD reductions in the fused kernel inner loop.** Replace the serial D-element accumulation with `simd_sum` for an additional ~30-50% speedup.
-- **Other deferred optimizations.** Shared-memory WHT in the quantize kernel (from v0.6.0 competitive audit).
+From the v0.9.0 analysis, four paths remain viable:
 
-### v0.9.0 — Long Context Validation
+1. **Precomputed Q·centroid table.** For 2-bit (4 centroids), precompute all 4 dot products `q · c[j]` once per query, then per-token work is a pure table gather with zero multiplications. Most promising near-term path — could be 2-3x faster than our current kernel approach.
+2. **Upstream MLX PR.** Make `mx.fast.scaled_dot_product_attention` itself aware of packed KV layouts. The correct long-term fix, but requires contributing to Apple's MLX core.
+3. **Very long contexts (32K+).** The crossover where memory bandwidth dominates might be beyond 8K. Our benchmarks topped out at T_kv=8K without reaching the memory-bound regime. Untested.
+4. **Indirection-free compression.** Affine quantization or NF4-style encoding that doesn't need centroid lookups, eliminating the data-dependent gather bottleneck.
 
-- Needle-in-haystack at 16K, 32K, 64K context (current tests go to 8K)
-- Benchmark on Qwen3.5-35B-A3B (MoE) and Llama-3.1-70B
+### Other Future Work
+
+- Needle-in-haystack validation at 16K-32K context
+- Benchmark on larger models: Qwen3.5-35B-A3B (MoE), Llama-3.1-70B
 - Tool-calling accuracy validation on real multi-turn agent conversations
-
-### Future
-
 - Upstream contribution to mlx-lm as an optional KV cache backend
 - Integration with [eden-fleet](https://github.com/alex-rentel/eden-fleet) for compressed KV cache transfer in distributed inference
 - 1-bit weight model compatibility (Bonsai 8B) — pending PrismML's upstream kernel merge
 
 ## Limitations
 
-1. **Decode overhead at long context (22-36% at 2K).** Decompression cost scales with cache size. The fused QK kernel (v0.7.0) achieves 2.12x speedup vs dequant+matmul in isolation but does NOT integrate cleanly into the end-to-end decode path: competing against `mx.fast.scaled_dot_product_attention` (a hyper-optimized single fused kernel) via a decomposed Q@K + softmax + V matmul sequence turns out to be slower, not faster. The experimental integration lives on `feat/fused-sdpa-qwen3` as a documented negative result; full details and next-step plan in [docs/FUSED_SDPA_RESULTS.md](docs/FUSED_SDPA_RESULTS.md). A proper fix requires writing a full fused attention kernel (Q@K^T + softmax + weighted sum over V, all in one dispatch, on packed KV) — deferred to v0.9.0.
+1. **Decode overhead at long context (22-36% at 2K).** Decompression cost scales with cache size. Two attempts to eliminate this via fused kernels both failed to beat `mx.fast.scaled_dot_product_attention` end-to-end: the decomposed approach (v0.8.0, [results](docs/FUSED_SDPA_RESULTS.md)) lost to dispatch overhead, and the full single-dispatch kernel (v0.9.0, [results](docs/FULL_FUSED_ATTENTION_RESULTS.md)) lost to centroid indirection overhead. Both are correct and preserved on branches for future work. See [Next Steps](#next-steps) for viable paths forward.
 2. **Error compounding.** Per-vector reconstruction error compounds through layers. Models with fewer KV heads (Gemma3-1B: 1 head) are more fragile.
 3. **Qwen3.5 partial coverage.** Only 8/32 layers use self-attention; memory savings are proportionally smaller.
 4. **Quality depends on outlier detection.** Disabling `auto_detect_outliers` drops Qwen2.5-7B from 0.80 → 0.46 cos_sim at K4/V2.
