@@ -174,6 +174,74 @@ class TestTurboQuantKVCacheBasic:
             assert k_out.shape == (1, 2, 20, d)
 
 
+class TestStateReload:
+    """Tests for the state property setter (used by mlx-lm cache restore)."""
+
+    def test_state_roundtrip_integer_bits(self):
+        """Save state, restore into a fresh cache, dequantization works."""
+        np.random.seed(2)
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=16, chunk_size=64)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        meta = cache.meta_state
+        state_tuple = cache.state
+
+        # Restore into fresh cache
+        new_cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                       residual_window=16, chunk_size=64)
+        new_cache.state = state_tuple
+        new_cache.meta_state = meta
+
+        # Force a fetch (zero-token update) to trigger lazy re-dequant
+        decode = mx.array(np.random.randn(1, 2, 1, 128).astype(np.float32))
+        k_out_old, _ = cache.update_and_fetch(decode, decode)
+        k_out_new, _ = new_cache.update_and_fetch(decode, decode)
+
+        # Shapes should match
+        assert k_out_old.shape == k_out_new.shape
+
+    def test_state_roundtrip_fractional_bits(self):
+        """Fractional bit configs (e.g. key_bits=3.5) survive state reload.
+
+        Regression test for a v0.5.0 latent bug where the lazy re-dequant
+        path called the non-fractional dequant helper with None centroids.
+        """
+        np.random.seed(3)
+        cache = TurboQuantKVCache(head_dim=128, key_bits=3.5, value_bits=2,
+                                  residual_window=16, chunk_size=64)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+
+        # Save and restore
+        state_tuple = cache.state
+        meta = cache.meta_state
+        # State tuple must include fractional lo arrays
+        assert len(state_tuple) == 10
+
+        new_cache = TurboQuantKVCache(head_dim=128, key_bits=3.5, value_bits=2,
+                                       residual_window=16, chunk_size=64)
+        new_cache.state = state_tuple
+        new_cache.meta_state = meta
+
+        # Lazy re-dequant must not crash on fractional path
+        decode = mx.array(np.random.randn(1, 2, 1, 128).astype(np.float32))
+        k_out, _ = new_cache.update_and_fetch(decode, decode)
+        # Just verify it didn't crash and returned correct total length
+        assert k_out.shape[2] == 201
+
+    def test_legacy_6tuple_state_still_loads(self):
+        """Backward compat: pre-v0.6.0 6-element state tuples still restore."""
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=16, chunk_size=64)
+        # Legacy 6-tuple has no sink and no fractional lo parts
+        legacy = (None, None, None, None, None, None)
+        cache.state = legacy
+        # Should not crash; state should be cleared
+        assert cache.sink_keys is None
+        assert cache._compressed_keys_lo is None
+
+
 class TestQJLCorrection:
     """Tests for optional 1-bit QJL sign-sketch residual correction."""
 

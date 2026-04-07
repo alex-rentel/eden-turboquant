@@ -113,7 +113,6 @@ class TurboQuantKVCache:
         self._decompressed_keys_cache: Optional[mx.array] = None
         self._decompressed_values_cache: Optional[mx.array] = None
         self._decompressed_valid: bool = False
-        self._dequant_calls: int = 0
 
         # Sequence offset (total tokens seen so far)
         self.offset: int = 0
@@ -129,12 +128,18 @@ class TurboQuantKVCache:
             self._compressed_value_norms,
             self.sink_keys,
             self.sink_values,
+            self._compressed_keys_lo,
+            self._compressed_values_lo,
         )
 
     @state.setter
     def state(self, v):
-        # Backward compatible: older states have 6 elements (no sink fields).
-        if len(v) == 6:
+        # Backward compatible state loading by tuple length:
+        #   6 elements — pre-v0.6.0 (no sink, no fractional lo parts)
+        #   8 elements — v0.6.0 with sink, no fractional lo parts
+        #  10 elements — v0.6.0 with sink and fractional lo parts (current)
+        n = len(v)
+        if n == 6:
             (
                 self.keys,
                 self.values,
@@ -142,6 +147,17 @@ class TurboQuantKVCache:
                 self._compressed_key_norms,
                 self._compressed_values,
                 self._compressed_value_norms,
+            ) = v
+        elif n == 8:
+            (
+                self.keys,
+                self.values,
+                self._compressed_keys,
+                self._compressed_key_norms,
+                self._compressed_values,
+                self._compressed_value_norms,
+                self.sink_keys,
+                self.sink_values,
             ) = v
         else:
             (
@@ -153,6 +169,8 @@ class TurboQuantKVCache:
                 self._compressed_value_norms,
                 self.sink_keys,
                 self.sink_values,
+                self._compressed_keys_lo,
+                self._compressed_values_lo,
             ) = v
         self._decompressed_valid = False
 
@@ -166,6 +184,8 @@ class TurboQuantKVCache:
             "value_bits": str(self.value_bits),
             "fp16_sink_size": str(self.fp16_sink_size),
             "sink_len": str(self._sink_len),
+            "fp16_len": str(self._fp16_len),
+            "fp16_capacity": str(self._fp16_capacity),
         }
 
     @meta_state.setter
@@ -176,6 +196,10 @@ class TurboQuantKVCache:
             self.fp16_sink_size = int(v["fp16_sink_size"])
         if "sink_len" in v:
             self._sink_len = int(v["sink_len"])
+        if "fp16_len" in v:
+            self._fp16_len = int(v["fp16_len"])
+        if "fp16_capacity" in v:
+            self._fp16_capacity = int(v["fp16_capacity"])
 
     def empty(self) -> bool:
         return self._fp16_len == 0 and self._compressed_len == 0 and self._sink_len == 0
@@ -305,6 +329,46 @@ class TurboQuantKVCache:
         flat_norms = norms.reshape(-1).astype(mx.float32)
         x_hat = x_hat * flat_norms[:, None]
         return x_hat.reshape(B, H, T, D)
+
+    def _rebuild_decompressed_cache(self) -> None:
+        """Re-dequantize the entire compressed cache from packed storage.
+
+        Used by the lazy state-reload path: when `cache.state` is set from
+        a saved tuple, the in-memory `_decompressed_*_cache` is None but the
+        compressed arrays are populated. This rebuilds the dense cache.
+
+        Handles both fractional and non-fractional bit widths. Note that
+        QJL correction CANNOT be re-applied here because the original
+        pre-quantization tensors are no longer available — the corrected
+        cache would have been baked in at compression time during the
+        original session.
+        """
+        if self._k_fractional:
+            self._decompressed_keys_cache = self._dequantize_kv_fractional(
+                self._compressed_keys, self._compressed_keys_lo,
+                self._compressed_key_norms,
+                self.k_centroids_hi, self._k_bits_hi,
+                self.k_centroids_lo, self._k_bits_lo,
+            )
+        else:
+            self._decompressed_keys_cache = self._dequantize_kv(
+                self._compressed_keys, self._compressed_key_norms,
+                self.k_centroids, int(self.key_bits),
+            )
+
+        if self._v_fractional:
+            self._decompressed_values_cache = self._dequantize_kv_fractional(
+                self._compressed_values, self._compressed_values_lo,
+                self._compressed_value_norms,
+                self.v_centroids_hi, self._v_bits_hi,
+                self.v_centroids_lo, self._v_bits_lo,
+            )
+        else:
+            self._decompressed_values_cache = self._dequantize_kv(
+                self._compressed_values, self._compressed_value_norms,
+                self.v_centroids, int(self.value_bits),
+            )
+        self._decompressed_valid = True
 
     def _apply_qjl_correction(self, original: mx.array, decompressed: mx.array) -> mx.array:
         """Apply 1-bit QJL sign-sketch correction to a dequantized tensor.
@@ -449,7 +513,6 @@ class TurboQuantKVCache:
                     [self._decompressed_values_cache, dv], axis=2
                 )
             self._decompressed_valid = True
-            self._dequant_calls += 1
 
     def _route_sink(self, keys: mx.array, values: mx.array) -> tuple[mx.array, mx.array]:
         """Peel off sink-bound tokens from the head of the incoming batch.
@@ -549,19 +612,12 @@ class TurboQuantKVCache:
         self._compress_old_tokens()
 
         # Build full KV: [sink (FP16, permanent) | decompressed_middle | residual_fp16]
-        # Only re-decompresses when _compress_old_tokens moved tokens to
-        # compressed storage. Sink tokens are always returned as-is.
+        # The decompressed_*_cache is built incrementally inside
+        # _compress_old_tokens(). The branch below handles state-reload paths
+        # (cache.state setter from a saved tuple), where the in-memory cache
+        # is empty but compressed_* arrays are populated from disk.
         if self._compressed_len > 0 and not self._decompressed_valid:
-            self._decompressed_keys_cache = self._dequantize_kv(
-                self._compressed_keys, self._compressed_key_norms,
-                self.k_centroids, self.key_bits,
-            )
-            self._decompressed_values_cache = self._dequantize_kv(
-                self._compressed_values, self._compressed_value_norms,
-                self.v_centroids, self.value_bits,
-            )
-            self._decompressed_valid = True
-            self._dequant_calls += 1
+            self._rebuild_decompressed_cache()
 
         parts_k = []
         parts_v = []
