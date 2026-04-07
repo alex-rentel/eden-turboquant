@@ -654,6 +654,192 @@ _fused_qk_4bit_batched_kernel = mx.fast.metal_kernel(
 )
 
 
+# ============================================================
+# Full fused attention kernel (v0.9.0 attempt — online softmax)
+# ============================================================
+#
+# Adapts sharpner's _FUSED_ATTN_NOROT pattern for our uint8 2-bit
+# packing. See docs/FULL_FUSED_KERNEL_DESIGN.md for math.
+#
+# Minimum viable scope:
+#   B = 1, T_q = 1, D = 128, 2-bit K and V with shared codebook, GQA
+#
+# Grid: (H_q * 1024, 1, 1) — threadgroup (1024, 1, 1) = 32 simdgroups
+# Lane L owns output dims [L*4, L*4+3]. Each simdgroup walks stride-32
+# slice of T_kv. Online softmax state in registers during the loop;
+# single threadgroup barrier at the end for cross-simdgroup combine.
+
+_FUSED_ATTN_2BIT_SOURCE = """
+    uint head = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint simd_id = tid >> 5;
+    uint lane_id = tid & 31;
+
+    uint D_val = D;
+    uint bytes_per_token = D_val / 4;
+    uint H_q_val = HQ;
+    uint H_kv_val = HKV;
+    uint T_kv_val = TKV;
+
+    uint n_repeats = H_q_val / H_kv_val;
+    uint kv_head = head / n_repeats;
+
+    float q[4];
+    uint q_base = head * D_val + lane_id * 4;
+    q[0] = q_rot[q_base + 0];
+    q[1] = q_rot[q_base + 1];
+    q[2] = q_rot[q_base + 2];
+    q[3] = q_rot[q_base + 3];
+
+    uint kv_norm_base = kv_head * T_kv_val;
+    uint kv_packed_base = kv_head * T_kv_val * bytes_per_token;
+
+    float local_max = -1e10f;
+    float local_sum = 0.0f;
+    float local_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint k = simd_id; k < T_kv_val; k += 32) {
+        uint k_byte = packed_k[kv_packed_base + k * bytes_per_token + lane_id];
+        uint k_idx_0 = (k_byte >> 0) & 0x03u;
+        uint k_idx_1 = (k_byte >> 2) & 0x03u;
+        uint k_idx_2 = (k_byte >> 4) & 0x03u;
+        uint k_idx_3 = (k_byte >> 6) & 0x03u;
+
+        float partial =
+            q[0] * centroids[k_idx_0] +
+            q[1] * centroids[k_idx_1] +
+            q[2] * centroids[k_idx_2] +
+            q[3] * centroids[k_idx_3];
+
+        float dot = simd_sum(partial);
+        float score = dot * norms_k[kv_norm_base + k];
+
+        float new_max = max(local_max, score);
+        float alpha = metal::fast::exp(local_max - new_max);
+        float beta  = metal::fast::exp(score - new_max);
+        local_max = new_max;
+        local_sum = local_sum * alpha + beta;
+
+        uint v_byte = packed_v[kv_packed_base + k * bytes_per_token + lane_id];
+        uint v_idx_0 = (v_byte >> 0) & 0x03u;
+        uint v_idx_1 = (v_byte >> 2) & 0x03u;
+        uint v_idx_2 = (v_byte >> 4) & 0x03u;
+        uint v_idx_3 = (v_byte >> 6) & 0x03u;
+
+        float vn = norms_v[kv_norm_base + k];
+        local_acc[0] = local_acc[0] * alpha + beta * vn * centroids[v_idx_0];
+        local_acc[1] = local_acc[1] * alpha + beta * vn * centroids[v_idx_1];
+        local_acc[2] = local_acc[2] * alpha + beta * vn * centroids[v_idx_2];
+        local_acc[3] = local_acc[3] * alpha + beta * vn * centroids[v_idx_3];
+    }
+
+    threadgroup float tg_max[32];
+    threadgroup float tg_sum[32];
+    threadgroup float tg_acc[32 * 128];
+
+    if (lane_id == 0) {
+        tg_max[simd_id] = local_max;
+        tg_sum[simd_id] = local_sum;
+    }
+    tg_acc[simd_id * 128 + lane_id * 4 + 0] = local_acc[0];
+    tg_acc[simd_id * 128 + lane_id * 4 + 1] = local_acc[1];
+    tg_acc[simd_id * 128 + lane_id * 4 + 2] = local_acc[2];
+    tg_acc[simd_id * 128 + lane_id * 4 + 3] = local_acc[3];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -1e10f;
+    for (uint s = 0; s < 32; s++) {
+        global_max = max(global_max, tg_max[s]);
+    }
+
+    float global_sum = 0.0f;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint s = 0; s < 32; s++) {
+        float factor = metal::fast::exp(tg_max[s] - global_max);
+        global_sum += tg_sum[s] * factor;
+        result[0] += tg_acc[s * 128 + lane_id * 4 + 0] * factor;
+        result[1] += tg_acc[s * 128 + lane_id * 4 + 1] * factor;
+        result[2] += tg_acc[s * 128 + lane_id * 4 + 2] * factor;
+        result[3] += tg_acc[s * 128 + lane_id * 4 + 3] * factor;
+    }
+
+    float inv = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+    uint out_base = head * D_val + lane_id * 4;
+    out[out_base + 0] = result[0] * inv;
+    out[out_base + 1] = result[1] * inv;
+    out[out_base + 2] = result[2] * inv;
+    out[out_base + 3] = result[3] * inv;
+"""
+
+_fused_attn_2bit_kernel = mx.fast.metal_kernel(
+    name="turboquant_fused_attention_2bit",
+    input_names=["q_rot", "packed_k", "norms_k", "packed_v", "norms_v", "centroids"],
+    output_names=["out"],
+    source=_FUSED_ATTN_2BIT_SOURCE,
+    # Trailing newline is REQUIRED — MLX concatenates this header inline
+    # with its generated `template <...>` line and otherwise produces
+    # `#include <metal_simdgroup>template <int D, ...>` which fails to parse.
+    header="#include <metal_simdgroup>\n",
+)
+
+
+def fused_attention_2bit_2bit(
+    q_rot: mx.array,
+    packed_k: mx.array,
+    norms_k: mx.array,
+    packed_v: mx.array,
+    norms_v: mx.array,
+    centroids: mx.array,
+    H_q: int,
+    H_kv: int,
+    T_kv: int,
+    D: int,
+) -> mx.array:
+    """Single-dispatch fused attention from 2-bit packed K and V.
+
+    Implements Q @ K^T + online softmax + weighted sum over V in one
+    Metal kernel. V is accumulated in rotated space inside the kernel;
+    the caller is responsible for pre-rotating Q and post-rotating the
+    output.
+
+    Args:
+        q_rot: (H_q, D) float32 — caller computes as
+               ``pre_rotate_query(Q * (1/sqrt(D)), rotation)``
+        packed_k: (H_kv, T_kv, D/4) uint8
+        norms_k: (H_kv, T_kv) float32
+        packed_v: (H_kv, T_kv, D/4) uint8
+        norms_v: (H_kv, T_kv) float32
+        centroids: (4,) float32 — shared codebook for K and V
+        H_q, H_kv, T_kv, D: shape metadata (template params)
+
+    Returns:
+        (H_q, D) float32 in rotated space. Caller must inverse-rotate
+        with ``output @ rotation`` to get the final attention output.
+    """
+    if D != 128:
+        raise NotImplementedError(
+            f"fused_attention_2bit_2bit MVP requires D=128, got {D}"
+        )
+    if H_q % H_kv != 0:
+        raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
+
+    q_f32 = q_rot.astype(mx.float32) if q_rot.dtype != mx.float32 else q_rot
+    nk_f32 = norms_k.astype(mx.float32) if norms_k.dtype != mx.float32 else norms_k
+    nv_f32 = norms_v.astype(mx.float32) if norms_v.dtype != mx.float32 else norms_v
+    cent_f32 = centroids.astype(mx.float32) if centroids.dtype != mx.float32 else centroids
+
+    result = _fused_attn_2bit_kernel(
+        inputs=[q_f32, packed_k, nk_f32, packed_v, nv_f32, cent_f32],
+        output_shapes=[(H_q * D,)],
+        output_dtypes=[mx.float32],
+        grid=(H_q * 1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        template=[("D", D), ("HQ", H_q), ("HKV", H_kv), ("TKV", T_kv)],
+    )
+    return result[0].reshape(H_q, D)
+
+
 def fused_qk_scores_4bit_batched(
     q_rot: mx.array,      # (B, H, T_q, D) float32
     packed_k: mx.array,   # (B, H_kv, T_kv, D/2) uint8
