@@ -1,8 +1,8 @@
 # mlx-turboquant
 
-Near-optimal KV cache quantization for Apple Silicon. Faithful implementation of [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni — ICLR 2026).
+Near-optimal KV cache compression for Apple Silicon. Drop-in for any [mlx-lm](https://github.com/ml-explore/mlx-lm) model — 3-4x memory savings with no training, no calibration data, and no architecture changes.
 
-Compresses the KV cache during LLM inference by 3x with <0.3% quality loss. No training, no calibration data, fully data-oblivious. Drop-in for any [mlx-lm](https://github.com/ml-explore/mlx-lm) model.
+Faithful implementation of [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni — Google Research, ICLR 2026).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -19,66 +19,117 @@ from mlx_lm import load
 from mlx_turboquant import apply_turboquant
 
 model, tokenizer = load("mlx-community/Qwen3-8B-4bit")
-apply_turboquant(model, key_bits=4, value_bits=2)
+apply_turboquant(model, key_bits=4, value_bits=2, fp16_sink_size=128)
 
 cache = model.make_cache()
-# Use cache normally — older tokens are compressed automatically
 logits = model(inputs, cache=cache)
+# Older tokens are compressed to 3-4 bits automatically.
+# The first 128 tokens (system prompt) stay in FP16 permanently.
+# The last 128 tokens (residual window) stay in FP16 until they age out.
 ```
 
-## Benchmarks
+## The Problem
 
-**12 models × 5 configs**, M1 Max 64GB / mlx 0.31.1. Full tables and methodology in [BENCHMARKS.md](BENCHMARKS.md). Highlights below.
+Every token an LLM generates stores key and value vectors for every layer. At FP16, an 8B model's KV cache eats ~576 MB at 4K context and scales linearly — 16K context means 2.3 GB just for the cache, on top of the model weights. On a 64GB Mac running a 4-bit 8B model (~4.5 GB weights), the KV cache becomes the bottleneck for long conversations, multi-turn agents, and RAG pipelines.
 
-### Quality (cos sim vs FP16, 500-token prompt, K4/V2 default)
+## What TurboQuant Does (The Paper)
 
-| Model | K4/V2 | **K4/V2 + sink128** | Sink boost |
+Google Research published TurboQuant at ICLR 2026. The core insight: KV cache vectors have structure that naive quantization ignores. TurboQuant exploits this in three steps:
+
+**Step 1 — Random rotation.** Multiply each KV vector by a fixed random orthogonal matrix (via QR decomposition). This transforms the coordinates into approximately independent, Beta-distributed random variables. The rotation is computed once at initialization and reused for every token.
+
+**Step 2 — Optimal scalar quantization.** Each rotated coordinate is quantized using a precomputed Lloyd-Max codebook optimized for the Beta distribution. Lloyd-Max minimizes mean squared error for a given number of bits — it's the information-theoretically optimal scalar quantizer. Only the quantization indices and the vector's L2 norm are stored.
+
+**Step 3 — Reconstruction.** Look up centroids from the codebook, apply the inverse rotation, rescale by the stored norm. The per-vector MSE is within 2.7x of the Shannon information-theoretic lower bound — you mathematically cannot do much better without changing the bit budget.
+
+The paper also describes a second algorithm (TurboQuant_prod) that adds a 1-bit QJL residual correction for unbiased inner product estimation. In practice, 6+ independent implementations confirmed this hurts quality as a drop-in cache replacement — it's only useful with custom fused attention kernels. We implement it as an opt-in experimental feature.
+
+## How It Works on MLX
+
+This library adapts TurboQuant for Apple Silicon's unified memory architecture via MLX:
+
+**Fused Metal kernels.** The dequantize path (unpack indices → centroid lookup → inverse rotation → norm scaling) runs as a single Metal compute dispatch. No intermediate tensor allocations, no Python overhead per-token. This brought overhead from 57% (pure Python, v0.2.0) down to 11% (v0.5.0).
+
+**Asymmetric K/V bit allocation.** Community research confirmed that keys are far more sensitive to compression than values. Our default (K4/V2 — 4-bit keys, 2-bit values) gives ~3.6x compression with better quality than symmetric K3/V3, because attention scores depend on key precision more than value precision.
+
+**Attention sink (v0.6.0).** The first N tokens of a conversation — typically the system prompt containing tool schemas or instructions — stay in FP16 permanently, separate from the sliding residual window. On models where the system prompt defines behavior (Qwen family, Phi-3.5), this single feature improved cosine similarity from 0.88 → 0.98 on Qwen3-8B and from 0.80 → 0.95 on Qwen2.5-7B.
+
+**Outlier layer detection.** Some models (Qwen3, Qwen2.5) have layers where key norms spike 10-16x above median. Compressing these layers destroys quality. `auto_detect_outliers=True` (the default) identifies and skips them automatically.
+
+**Hybrid attention support (v0.6.0).** Newer architectures like Qwen3.5 alternate between `self_attn` and `linear_attn` layers. Linear attention layers don't use standard KV caches. The library detects this and only installs TurboQuant on self-attention layers — previously this would crash.
+
+**Fractional bit-widths.** 3.5-bit quantization splits channels: half at 4-bit, half at 3-bit. This fills the quality gap between K3 and K4 for applications that need the memory savings of 3-bit but can't tolerate the quality hit.
+
+## Results (v0.6.0)
+
+Benchmarked on M1 Max 64GB, MLX 0.31.1, April 2026. **12 models across 8 architecture families**, 5 TurboQuant configurations each. Full data in [BENCHMARKS.md](BENCHMARKS.md).
+
+### Headline: Attention Sink Quality
+
+The biggest win in v0.6.0. Pinning the system prompt in FP16 transforms quality on models that depend on those tokens:
+
+| Model | K4/V2 | K4/V2 + sink128 | Improvement |
 |---|---|---|---|
-| Qwen3-8B-4bit | 0.8825 | **0.9810** | **+0.098** |
-| Qwen2.5-7B-Instruct-4bit | 0.7960 | **0.9474** | **+0.151** |
-| Phi-3.5-mini-instruct-4bit | 0.9411 | **0.9971** | **+0.056** |
-| Llama-3.1-8B-Instruct-4bit | 0.9947 | 0.9973 | +0.003 |
-| Mistral-7B-Instruct-v0.3-4bit | 0.9944 | 0.9977 | +0.003 |
-| DeepSeek-R1-0528-Qwen3-8B-4bit | 0.9889 | 0.9907 | +0.002 |
+| Qwen2.5-7B | 0.7960 | **0.9474** | **+0.151** |
+| Qwen3-8B | 0.8825 | **0.9810** | **+0.098** |
+| Phi-3.5-mini | 0.9411 | **0.9971** | **+0.056** |
+| Llama-3.1-8B | 0.9947 | 0.9973 | +0.003 |
+| Mistral-7B | 0.9944 | 0.9977 | +0.003 |
+| DeepSeek-R1-8B | 0.9889 | 0.9907 | +0.002 |
 
-**Attention sink (`fp16_sink_size=128`) is the headline quality win of v0.6.0** — massive improvements on Qwen family and Phi-3.5-mini, negligible cost on models that already score >0.99 at K4/V2.
+Models that already scored >0.99 without the sink (Llama, Mistral, DeepSeek-R1) see negligible change — the feature helps exactly where it's needed and costs nothing where it isn't.
 
-### KV cache memory compression (K4/V2, 4K context)
+### KV Cache Compression (K4/V2, 4K context)
 
-| Model | Baseline | K4/V2 | Ratio |
+| Model | FP16 Baseline | TurboQuant K4/V2 | Compression |
 |---|---|---|---|
-| Phi-3.5-mini | 1536 MB | 406 MB | **3.78x** |
-| Qwen3-8B / DeepSeek-R1-Qwen3-8B | 576 MB | 161 MB | **3.57x** |
-| Llama-3.1-8B / Mistral-7B / Llama-3.2-3B | 512/448 MB | 133/116 MB | **3.86x** |
+| Phi-3.5-mini | 1,536 MB | 406 MB | **3.78x** |
+| Llama-3.1-8B / Mistral-7B | 512 MB | 133 MB | **3.86x** |
+| Qwen3-8B / DeepSeek-R1-8B | 576 MB | 161 MB | **3.57x** |
 | Gemma3-4B | 544 MB | 165 MB | **3.30x** |
 
-### Needle-in-a-Haystack (K4/V2 and K4/V2+sink128)
+On a 64GB Mac, this means 4x longer conversations or 4x more concurrent sessions at the same memory budget.
 
-| Model | FP16 baseline | K4/V2 | K4/V2 + sink128 |
+### Decode Speed
+
+At 256-token context (short conversations), K4/V2+sink128 adds only 1-5% overhead:
+
+| Model | Baseline tok/s | K4/V2+sink tok/s | Overhead |
 |---|---|---|---|
-| Qwen3-8B-4bit | **12/12** | **12/12** | **12/12** |
-| Llama-3.1-8B-Instruct-4bit | **12/12** | **12/12** | **12/12** |
-| Mistral-7B-Instruct-v0.3-4bit | 8/12 | 6/12 | 7/12 |
+| Qwen3-8B | 45.1 | 44.1 | **2%** |
+| Qwen3.5-9B | 42.8 | 42.4 | **1%** |
+| DeepSeek-R1-8B | 44.0 | 43.2 | **2%** |
+| Llama-3.1-8B | 59.2 | 56.5 | **5%** |
 
-Qwen3 and Llama-3.1 achieve perfect retrieval across all context lengths up to 8K under K4/V2 and K4/V2+sink128. Mistral-7B fails 4/12 cells even on FP16 baseline with this haystack — TurboQuant tracks but does not exceed the model's inherent limit.
+At 2048 tokens, overhead increases to 12-36% depending on model due to decompression cost scaling with cache size. A fused attention-from-compressed kernel (see [Next Steps](#next-steps)) would reduce this.
 
-### Architecture breadth
+**Surprise finding:** K4/V2+sink128 was 30% faster than FP16 baseline on TTFT at 2K context for Qwen3-8B (6,891 ms vs 9,836 ms). The smaller compressed cache reduces memory traffic during prefill.
 
-Validated on Qwen3, Qwen3.5 (hybrid attention), Qwen2.5, Llama 3.1/3.2, Mistral, Gemma 3, Phi 3.5, and DeepSeek R1 — **13 models across 8 architecture families**. The new hybrid attention support path automatically detects and skips `linear_attn` layers (Qwen3.5 has 24 of 32 layers that would otherwise crash compression).
+### Needle-in-a-Haystack
 
-## How It Works
+Retrieval of a hidden fact across 1K-8K context, needle at 10%, 50%, and 90% depth (12 tests per config):
 
-TurboQuant implements both algorithms from the paper:
+| Model | FP16 Baseline | K4/V2 | K4/V2+sink128 |
+|---|---|---|---|
+| Qwen3-8B | **12/12** | **12/12** | **12/12** |
+| Llama-3.1-8B | **12/12** | **12/12** | **12/12** |
+| Mistral-7B | 8/12 | 6/12 | 7/12 |
 
-**Algorithm 1 — TurboQuant_mse (default).** A fixed random orthogonal matrix (QR decomposition) rotates each KV vector so that its coordinates become approximately independent and Beta-distributed. Each coordinate is then quantized using a precomputed Lloyd-Max codebook optimized for that distribution. Only the quantization indices and the vector's L2 norm are stored. To dequantize: look up centroids, inverse-rotate, rescale by norm. The per-vector MSE is within 2.7x of the Shannon information-theoretic lower bound.
+Qwen3-8B and Llama-3.1-8B pass perfectly — zero retrieval regression. Mistral-7B fails 4/12 on the FP16 baseline itself; TurboQuant tracks but does not exceed the model's inherent limit.
 
-**Algorithm 2 — TurboQuant_prod (opt-in).** Applies (b-1)-bit MSE quantization, computes the residual, then applies a 1-bit Quantized Johnson-Lindenstrauss (QJL) transform on the residual. This produces an unbiased inner product estimator. However, 6+ independent community implementations confirmed that QJL hurts quality as a drop-in KV cache replacement — it's only beneficial with fused attention kernels that consume the two-part representation directly. Algorithm 1 (MSE-only) is the default for this reason.
+### Architecture Breadth
 
-**Key design decisions informed by community findings:**
-- Asymmetric K/V allocation — keys need more bits than values (K4/V2 recommended)
-- Residual window — recent tokens stay in FP16 for quality (default: 128 tokens)
-- Outlier layer detection — some models (Qwen3) have layers with extreme key norms that must stay uncompressed
-- Few-KV-head safety — models with ≤2 KV heads (Gemma3-1B) auto-upgrade to K4/V3 minimum
+| Family | Models Tested | head_dim | KV Heads | Notes |
+|---|---|---|---|---|
+| Qwen3 | 0.6B, 1.7B, 4B, 8B | 128 | 8 | Outlier layers detected and skipped |
+| Qwen3.5 | 9B | varies | varies | Hybrid attention — 24/32 layers auto-skipped |
+| Qwen2.5 | 7B | 128 | 4 | Previous gen, validates backward compat |
+| Llama 3.1 | 8B | 128 | 8 | GQA architecture |
+| Llama 3.2 | 3B | 128 | 8 | Smaller Llama |
+| Mistral | 7B v0.3 | 128 | 8 | Sliding window attention |
+| Gemma 3 | 1B, 4B | 256 | 1-4 | 1-KV-head models auto-upgrade to K4/V3 |
+| Phi 3.5 | mini (3.8B) | 96 | 32 | Non-power-of-2 head_dim, no GQA |
+| DeepSeek R1 | 8B (Qwen3 distill) | 128 | 8 | Reasoning model, long CoT chains |
 
 ## Configuration
 
@@ -87,45 +138,35 @@ apply_turboquant(
     model,
     key_bits=4,                # 2, 3, 3.5, or 4 bits for keys
     value_bits=2,              # 2, 3, 3.5, or 4 bits for values
-    residual_window=128,       # recent tokens stay in FP16 (sliding window)
+    residual_window=128,       # recent tokens stay in FP16 (sliding)
+    fp16_sink_size=128,        # first N tokens stay FP16 permanently (v0.6.0)
     auto_detect_outliers=True, # skip layers with extreme key norms
-    skip_layers=[0, 27],       # manually specify FP16 layers
-    # New in v0.6.0:
-    fp16_sink_size=128,        # permanent FP16 sink for first N tokens
-                               # (system prompt). Default 0 = disabled.
-                               # Improves cosine sim by +0.002 to +0.003
-                               # on Qwen3 family with no speed cost.
-    chunk_size=0,              # 0 (default) = v0.5.0 batch compression.
-                               # >0 enables fixed-size chunked draining.
-                               # Opt in for future kernel work; benchmark-
-                               # neutral with current Metal kernels.
-    qjl_correction=False,      # EXPERIMENTAL. 1-bit QJL sign-sketch
-                               # residual correction. Helps Qwen3-8B
-                               # (+0.0017 cos sim) but HURTS Qwen3-1.7B
-                               # (-0.0052). Default OFF.
-    qjl_n_proj=32,             # QJL projection rank (when correction on).
+    skip_layers=[0, 27],       # manually pin specific layers in FP16
+    chunk_size=0,              # 0 = default batch compression, >0 = fixed chunks
+    qjl_correction=False,      # experimental: 1-bit QJL residual correction
 )
 ```
 
-### When to enable `fp16_sink_size`
+### Which config to use
 
-Enable for tool-calling, JSON-mode extraction, or any workflow where the
-first 64-256 tokens carry critical schema or instruction tokens you want
-to preserve bit-exactly. The cost is `fp16_sink_size * 2 * head_dim *
-num_kv_heads * 4 bytes` per layer of additional FP16 memory — typically
-under 5 MB total even for large models.
+| Use Case | Config | Why |
+|---|---|---|
+| **Default / balanced** | `key_bits=4, value_bits=2` | 3.6x compression, >0.98 cos_sim on most models |
+| **Tool-calling / chat** | Same + `fp16_sink_size=128` | Preserves system prompt tokens defining tool schemas |
+| **Memory-constrained** | `key_bits=3, value_bits=2` | 4.0-4.4x compression, quality depends on model |
+| **Conservative** | `key_bits=4, value_bits=4` | 2.5-3.1x compression, minimal quality loss |
 
-You can also use the low-level quantizer directly:
+### Low-level API
 
 ```python
 from mlx_turboquant import TurboQuantMSE, TurboQuantProd
 
-# Algorithm 1: MSE-optimized (recommended for KV cache)
+# Algorithm 1: MSE-optimized (recommended)
 tq = TurboQuantMSE(d=128, bits=4)
 qt = tq.quantize(vectors)
 vectors_hat = tq.dequantize(qt)
 
-# Algorithm 2: Inner-product optimized (for custom attention kernels)
+# Algorithm 2: inner-product optimized (custom attention kernels only)
 tq_prod = TurboQuantProd(d=128, bits=4)
 qt = tq_prod.quantize(vectors)
 ```
@@ -133,116 +174,104 @@ qt = tq_prod.quantize(vectors)
 ## CLI
 
 ```bash
-# Generate text with TurboQuant compression
 mlx-turboquant generate \
   --model mlx-community/Qwen3-8B-4bit \
   --prompt "Explain quantum computing" \
   --key-bits 4 --value-bits 2
 
-# Run benchmarks
 mlx-turboquant benchmark \
   --model mlx-community/Qwen3-8B-4bit \
   --benchmarks quality memory speed
 ```
 
-## Supported Models
-
-Any model loaded via `mlx_lm.load()`. Tested on:
-
-| Family | Models Tested | head_dim | Notes |
-|--------|--------------|----------|-------|
-| Qwen3 | 1.7B, 8B | 128 | Excellent quality, has outlier layers |
-| Gemma3 | 1B, 4B | 256 | Works well up to ~1K context |
-| Llama 3.2 | 3B | 128 | Tested, coherent generation |
-| Mistral | 7B v0.3 | 128 | Tested, excellent quality (0.998 cos_sim) |
-
 ## Project Structure
 
 ```
 mlx_turboquant/
+  cache.py        # TurboQuantKVCache — drop-in for mlx-lm's KVCache
+  patch.py        # apply_turboquant() monkey-patch, hybrid attention detection
+  kernels.py      # Fused Metal compute kernels (dequantize, quantize)
+  quantizer.py    # TurboQuantMSE (Algo 1) + TurboQuantProd (Algo 2)
   codebook.py     # Lloyd-Max optimal scalar quantizer for Beta distributions
   rotation.py     # Random orthogonal rotation (QR) + Walsh-Hadamard
-  quantizer.py    # TurboQuantMSE (Algorithm 1) + TurboQuantProd (Algorithm 2)
   qjl.py          # Quantized Johnson-Lindenstrauss transform
   packing.py      # 1/2/3/4-bit index packing into uint8
-  kernels.py      # Fused Metal compute kernels (dequantize, quantize)
-  cache.py        # TurboQuantKVCache — drop-in for mlx-lm's KVCache
-  patch.py        # Model patching — apply_turboquant() monkey-patch
   cli.py          # Command-line interface
   codebooks/      # Precomputed Lloyd-Max codebooks (.npz)
-benchmarks/       # Quality, memory, speed, needle-in-haystack benchmarks
-                  # bench_v06.py + needle_haystack_v06.py for v0.6.0 sweep
-tests/            # 157 unit tests + 1 integration test with real model
+benchmarks/       # Full benchmark suite (run_full_suite.py, models.yaml)
+results/          # Raw JSON benchmark data (12 models × 5 configs)
+tests/            # 159 unit tests + 1 integration test
+docs/             # Competitive audit, optimization log, research notes
 ```
 
-## Running Tests
+## Tests
 
 ```bash
-# Unit tests (no model download, fast)
-python -m pytest tests/ -q --ignore=tests/test_integration.py
+python -m pytest tests/ -q --ignore=tests/test_integration.py   # fast, no downloads
+python -m pytest tests/test_integration.py -v -m slow            # real model, ~1GB download
 
-# Integration test (downloads ~1GB model)
-python -m pytest tests/test_integration.py -v -m slow
-
-# Benchmarks (downloads models, takes several minutes)
-python benchmarks/bench_quality.py
-python benchmarks/bench_memory.py
-python benchmarks/bench_speed.py
+# Full benchmark sweep (2-4 hours)
+python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 1
+python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 2
 ```
 
-## Limitations
+## Version History
 
-1. **Decode speed overhead (~11%):** Fused Metal kernels + batch compression + pre-allocated windows reduced overhead from 57% to 11%. The remaining overhead is MLX per-operation dispatch cost (~0.25ms per concatenate). A fused attention-from-compressed kernel would eliminate this entirely.
-2. **Error compounding:** Per-vector reconstruction error (~0.5%) compounds through transformer layers. Models with more KV heads (Qwen3: 8 heads) are more robust than those with fewer (Gemma3-1B: 1 head).
-3. **Context-dependent compression:** At contexts shorter than `residual_window`, no compression occurs. Memory savings grow with context length.
-
-## Roadmap
-
-### Completed
-
-| Version | Feature | Result |
-|---------|---------|--------|
+| Version | What Changed | Key Result |
+|---|---|---|
 | v0.2.0 | Real model testing, vectorized quantization | 6 model families validated |
-| v0.3.0 | Fused Metal dequantize kernels | 57% → 33% overhead |
+| v0.3.0 | Fused Metal dequantize kernels | 57% → 33% decode overhead |
 | v0.4.0 | 3.5-bit fractional, needle-in-haystack, PyPI packaging | 12/12 retrieval at 1K-8K |
-| v0.5.0 | Batch compression + pre-allocated FP16 window | 33% → **11%** overhead |
-| **v0.6.0** | Attention sink + QJL correction + state-reload fixes + hybrid attention | **+0.098 cos_sim on Qwen3-8B** from sink, 12/12 needle preserved, 12 models validated |
+| v0.5.0 | Batch compression, pre-allocated FP16 window | 33% → **11%** decode overhead |
+| **v0.6.0** | Attention sink, hybrid attention, QJL correction, 12-model sweep | **+0.098 cos_sim** on Qwen3-8B, 12 models × 8 families validated |
 
-### Next: Fused Attention-from-Compressed Kernel
+## Next Steps
 
-The remaining 11% overhead is MLX dispatch cost from concatenating decompressed + FP16 tensors. The path to sub-5%:
+### v0.7.0 — Metal Kernel Improvements
 
-1. **Fused attention-from-compressed kernel:** Compute Q @ K^T directly from packed indices without materializing the full dequantized K tensor. Another MLX TurboQuant implementation demonstrated 0.98x native speed with this approach.
-2. **Walsh-Hadamard fast path:** WHT is O(d log d) vs O(d²) for QR. Works for Qwen3 but degrades Gemma3 by 1.6%. A dimension-adaptive strategy could use WHT where safe.
+The competitive audit ([docs/COMPETITIVE_AUDIT.md](docs/COMPETITIVE_AUDIT.md)) identified three optimizations deferred from v0.6.0:
+
+- **Shared-memory WHT in quantize kernel.** Move Walsh-Hadamard from per-thread to threadgroup shared memory with butterfly barriers. Reduces quantize latency.
+- **SIMD reductions in dequant kernel.** Replace scalar accumulation with `simd_sum` for the inverse-rotation dot product. ~2x speedup on the inner loop.
+- **Fused attention-from-compressed kernel.** Compute Q @ K^T directly from packed indices without materializing dequantized K. Would drop decode overhead from 11-36% to near zero. arozanov/turboquant-mlx claims 0.98x native speed with this approach but benchmarks are unverified.
+
+### v0.8.0 — Long Context Validation
+
+- Needle-in-haystack at 16K, 32K, 64K context (current tests go to 8K)
+- Benchmark on Qwen3.5-35B-A3B (MoE) and Llama-3.1-70B
+- Tool-calling accuracy validation on real multi-turn agent conversations
 
 ### Future
 
-- Needle-in-a-haystack validation at 16K-32K context
-- Integration with [eden-fleet](https://github.com/alex-rentel/eden-fleet) for distributed inference with compressed KV cache transfer between nodes
 - Upstream contribution to mlx-lm as an optional KV cache backend
+- Integration with [eden-fleet](https://github.com/alex-rentel/eden-fleet) for compressed KV cache transfer in distributed inference
+- 1-bit weight model compatibility (Bonsai 8B) — pending PrismML's upstream kernel merge
+
+## Limitations
+
+1. **Decode overhead at long context (22-36% at 2K).** Decompression cost scales with cache size. The fused attention kernel would fix this.
+2. **Error compounding.** Per-vector reconstruction error compounds through layers. Models with fewer KV heads (Gemma3-1B: 1 head) are more fragile.
+3. **Qwen3.5 partial coverage.** Only 8/32 layers use self-attention; memory savings are proportionally smaller.
+4. **Quality depends on outlier detection.** Disabling `auto_detect_outliers` drops Qwen2.5-7B from 0.80 → 0.46 cos_sim at K4/V2.
 
 ## Part of the Eden Ecosystem
 
-mlx-turboquant is part of a local-first AI development ecosystem for Apple Silicon:
-
 - [eden](https://github.com/alex-rentel/eden) — Local AI agent framework
-- [eden-flywheel](https://github.com/alex-rentel/eden-flywheel) — Capture Claude Code sessions → training data → fine-tune → deploy
-- [eden-fleet](https://github.com/alex-rentel/eden-fleet) — Distribute AI workloads across a Mac homelab via SSH
-- [eden-models](https://github.com/alex-rentel/eden-models) — Training pipeline for 1-bit tool-calling LLMs on HPC
-- [mlx-nanochat](https://github.com/alex-rentel/mlx-nanochat) — Train ChatGPT-class models on Mac (port of Karpathy's nanochat)
+- [eden-flywheel](https://github.com/alex-rentel/eden-flywheel) — Claude Code sessions → training data → fine-tune → deploy
+- [eden-fleet](https://github.com/alex-rentel/eden-fleet) — Distributed AI across a Mac homelab via SSH
+- [eden-models](https://github.com/alex-rentel/eden-models) — Training pipeline for tool-calling LLMs on HPC
+- [mlx-nanochat](https://github.com/alex-rentel/mlx-nanochat) — Train ChatGPT-class models on Mac
 - **mlx-turboquant** — KV cache compression for longer contexts on Apple Silicon
 
 ## Community Implementations
 
-The TurboQuant MLX space moved fast after the paper dropped. Notable implementations worth checking out:
+- [sharpner/turboquant-mlx](https://github.com/sharpner/turboquant-mlx) — V2 + V3 dual-path, best QJL analysis in the community
+- [arozanov/turboquant-mlx](https://github.com/arozanov/turboquant-mlx) — Claims 98% FP16 speed via fused attention kernel (unverified)
+- [rachittshah/mlx-turboquant](https://github.com/rachittshah/mlx-turboquant) — Clean drop-in KVCache, no Metal kernels
+- [helgklaizar/turboquant_mlx](https://github.com/helgklaizar/turboquant_mlx) — Attention sink + dynamic chunking, affine quantization
+- [flovflo/turboquant-mlx-qwen35-kv](https://huggingface.co/flovflo/turboquant-mlx-qwen35-kv) — Qwen 3.5 35B benchmarks, honestly labeled as "TurboQuant-inspired"
 
-- [sharpner/turboquant-mlx](https://github.com/sharpner/turboquant-mlx) — V2 (affine, fast) + V3 (Lloyd-Max, correct) dual-path architecture. Thorough analysis of QJL as correction vs replacement.
-- [arozanov/turboquant-mlx](https://github.com/arozanov/turboquant-mlx) — Fused Metal kernels with parallel threadgroup WHT, layer-adaptive FP16/TurboQuant mixing. Reports 4.6x compression at 98% FP16 speed.
-- [rachittshah/mlx-turboquant](https://github.com/rachittshah/mlx-turboquant) — Clean drop-in KVCache replacement with precomputed Lloyd-Max codebooks for N(0,1).
-- [helgklaizar/turboquant_mlx](https://github.com/helgklaizar/turboquant_mlx) — Asymmetric PolarQuant with attention sink preservation and dynamic chunking. Two-line monkey-patch into mlx_lm.
-- [flovflo/turboquant-mlx-qwen35-kv](https://huggingface.co/flovflo/turboquant-mlx-qwen35-kv) — Qwen 3.5 35B benchmarks showing 26% faster generation and 44% cache reduction.
-
-This repo differentiates by combining fused Metal dequant kernels, asymmetric K/V bit allocation, per-model outlier layer detection, and fractional (3.5-bit) quantization in a single drop-in package — validated across 6 model families with needle-in-haystack testing.
+This repo differentiates with: fused Metal kernels on the Lloyd-Max codebook path, asymmetric K/V bits, attention sink, outlier detection, hybrid attention support, fractional 3.5-bit, and a 12-model benchmark sweep with needle-in-haystack validation.
 
 ## Citation
 
