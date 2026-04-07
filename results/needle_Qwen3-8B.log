@@ -1,0 +1,60 @@
+Loading mlx-community/Qwen3-8B-4bit...
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 218200.79it/s]
+Loaded in 1.2s
+
+  config: baseline (FP16)
+     context  position   result  answer
+        1024       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'.  The" (5.5s)
+        1024       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (5.1s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (5.1s)
+        2048       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (10.3s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (10.3s)
+        2048       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (10.3s)
+        4096       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (20.5s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (20.5s)
+        4096       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (20.5s)
+        8192       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (43.2s)
+        8192       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (43.2s)
+        8192       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (43.2s)
+    -> 12/12 pass
+
+  config: k4v2 (v0.5.0 default)
+     context  position   result  answer
+        1024       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (4.7s)
+        1024       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (4.5s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (4.7s)
+        2048       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (9.3s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (9.4s)
+        2048       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (8.7s)
+        4096       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (17.7s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (17.9s)
+        4096       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (18.0s)
+        8192       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (45.0s)
+        8192       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'.  The" (36.9s)
+        8192       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (33.8s)
+    -> 12/12 pass
+
+  config: k4v2_sink128 (v0.6.0 best)
+     context  position   result  answer
+        1024       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (4.3s)
+        1024       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (3.9s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (3.9s)
+        2048       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (12.6s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (7.9s)
+        2048       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (7.9s)
+        4096       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (17.9s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (15.5s)
+        4096       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (15.6s)
+        8192       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'."      (35.1s)
+        8192       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (33.8s)
+        8192       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'."      (33.6s)
+    -> 12/12 pass
+
+======================================================================
+Summary
+======================================================================
+  baseline                          12/12
+  k4v2                              12/12
+  k4v2_sink128                      12/12
+
+  k4v2_sink128 achieved full retrieval — no regression.

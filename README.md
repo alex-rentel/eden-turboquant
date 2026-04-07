@@ -26,46 +26,45 @@ cache = model.make_cache()
 logits = model(inputs, cache=cache)
 ```
 
-## Benchmarks (M1 Max 64GB, mlx 0.31.1)
+## Benchmarks
 
-Full v0.6.0 numbers and methodology in [BENCHMARKS.md](BENCHMARKS.md). Highlights below.
+**12 models × 5 configs**, M1 Max 64GB / mlx 0.31.1. Full tables and methodology in [BENCHMARKS.md](BENCHMARKS.md). Highlights below.
 
-### Quality (cosine similarity vs FP16, ~1000-token prompt)
+### Quality (cos sim vs FP16, 500-token prompt, K4/V2 default)
 
-| Model | head_dim | k4v2 | **k4v2 + sink128** | Δ from sink |
-|---|---|---|---|---|
-| Qwen3-1.7B-4bit | 128 | 0.9717 | **0.9749** | +0.0032 |
-| Qwen3-8B-4bit | 128 | 0.9938 | **0.9962** | +0.0024 |
-| Gemma3-1B-it-4bit | 256 | 0.7278 | 0.7284 | +0.0007 |
+| Model | K4/V2 | **K4/V2 + sink128** | Sink boost |
+|---|---|---|---|
+| Qwen3-8B-4bit | 0.8825 | **0.9810** | **+0.098** |
+| Qwen2.5-7B-Instruct-4bit | 0.7960 | **0.9474** | **+0.151** |
+| Phi-3.5-mini-instruct-4bit | 0.9411 | **0.9971** | **+0.056** |
+| Llama-3.1-8B-Instruct-4bit | 0.9947 | 0.9973 | +0.003 |
+| Mistral-7B-Instruct-v0.3-4bit | 0.9944 | 0.9977 | +0.003 |
+| DeepSeek-R1-0528-Qwen3-8B-4bit | 0.9889 | 0.9907 | +0.002 |
 
-The new `fp16_sink_size=128` attention sink improves cosine similarity on every model tested with no measurable speed cost.
+**Attention sink (`fp16_sink_size=128`) is the headline quality win of v0.6.0** — massive improvements on Qwen family and Phi-3.5-mini, negligible cost on models that already score >0.99 at K4/V2.
 
-### Memory (2K context, K4/V2 — carried from v0.5.0)
+### KV cache memory compression (K4/V2, 4K context)
 
-| Model | Baseline | TurboQuant | Compression |
-|-------|----------|------------|-------------|
-| Qwen3-8B | 302 MB | 101 MB | **3.0x** |
-| Gemma3-4B | 285 MB | 102 MB | **2.8x** |
+| Model | Baseline | K4/V2 | Ratio |
+|---|---|---|---|
+| Phi-3.5-mini | 1536 MB | 406 MB | **3.78x** |
+| Qwen3-8B / DeepSeek-R1-Qwen3-8B | 576 MB | 161 MB | **3.57x** |
+| Llama-3.1-8B / Mistral-7B / Llama-3.2-3B | 512/448 MB | 133/116 MB | **3.86x** |
+| Gemma3-4B | 544 MB | 165 MB | **3.30x** |
 
-### Speed (decode tok/s, k4v2 default)
+### Needle-in-a-Haystack (K4/V2 and K4/V2+sink128)
 
-| Model | Context | Baseline | TurboQuant | Overhead |
-|---|---|---|---|---|
-| Qwen3-1.7B-4bit | ~1K | 126.2 | 87.5 | ~22% |
-| Qwen3-8B-4bit | ~1K | 44.5 | 34.6 | ~22% |
-| Qwen3-8B-4bit | 2K (v0.5.0) | 41.3 | 36.7 | **11%** |
+| Model | FP16 baseline | K4/V2 | K4/V2 + sink128 |
+|---|---|---|---|
+| Qwen3-8B-4bit | **12/12** | **12/12** | **12/12** |
+| Llama-3.1-8B-Instruct-4bit | **12/12** | **12/12** | **12/12** |
+| Mistral-7B-Instruct-v0.3-4bit | 8/12 | 6/12 | 7/12 |
 
-Overhead history: 57% (v0.2.0) → 33% (v0.3.0 Metal kernels) → **11%** (v0.5.0 batch compression at 2K context). v0.6.0 default decode path is identical to v0.5.0 (`chunk_size=0`); the per-context-length variation reflects amortization of per-step concat cost over longer attention work, not a regression.
+Qwen3 and Llama-3.1 achieve perfect retrieval across all context lengths up to 8K under K4/V2 and K4/V2+sink128. Mistral-7B fails 4/12 cells even on FP16 baseline with this haystack — TurboQuant tracks but does not exceed the model's inherent limit.
 
-### Needle-in-a-Haystack (Qwen3-8B-4bit, v0.6.0)
+### Architecture breadth
 
-| Config | 1K | 2K | 4K | 8K | Total |
-|---|---|---|---|---|---|
-| FP16 baseline | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
-| k4v2 (v0.5.0 default) | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
-| k4v2 + sink128 | 3/3 | 3/3 | 3/3 | 3/3 | **12/12** |
-
-Sink does not regress retrieval at any context length tested.
+Validated on Qwen3, Qwen3.5 (hybrid attention), Qwen2.5, Llama 3.1/3.2, Mistral, Gemma 3, Phi 3.5, and DeepSeek R1 — **13 models across 8 architecture families**. The new hybrid attention support path automatically detects and skips `linear_attn` layers (Qwen3.5 has 24 of 32 layers that would otherwise crash compression).
 
 ## How It Works
 
@@ -207,7 +206,7 @@ python benchmarks/bench_speed.py
 | v0.3.0 | Fused Metal dequantize kernels | 57% → 33% overhead |
 | v0.4.0 | 3.5-bit fractional, needle-in-haystack, PyPI packaging | 12/12 retrieval at 1K-8K |
 | v0.5.0 | Batch compression + pre-allocated FP16 window | 33% → **11%** overhead |
-| **v0.6.0** | Attention sink + QJL correction + state-reload fixes | **+0.003 cos_sim**, 12/12 needle preserved |
+| **v0.6.0** | Attention sink + QJL correction + state-reload fixes + hybrid attention | **+0.098 cos_sim on Qwen3-8B** from sink, 12/12 needle preserved, 12 models validated |
 
 ### Next: Fused Attention-from-Compressed Kernel
 

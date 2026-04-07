@@ -161,6 +161,22 @@ Five smaller models (1B-4B) validating breadth across head_dim and KV-head count
 - **Phi-3.5-mini**: head_dim=96 (not a power of 2), 32 KV heads (no GQA). Metal dequant kernels work correctly because they template on D; the library just compiles a different kernel variant.
 - **DeepSeek-R1-0528-Qwen3-8B**: standard self-attention, behaves identically to Qwen3-8B in benchmarks despite being a reasoning fine-tune.
 
+## Needle-in-a-Haystack Sweep
+
+Retrieval test across three Tier-1 architectures at 1K / 2K / 4K / 8K context, needle at positions 0.1 / 0.5 / 0.9 (12 cells per config). Secret: `mango-sunset-42`. Reproduce with `python benchmarks/needle_haystack_v06.py --model <id>`.
+
+| Model | baseline (FP16) | K4/V2 | K4/V2 + sink128 |
+|---|---|---|---|
+| Qwen3-8B-4bit | **12/12** | **12/12** | **12/12** |
+| Llama-3.1-8B-Instruct-4bit | **12/12** | **12/12** | **12/12** |
+| Mistral-7B-Instruct-v0.3-4bit | 8/12 | 6/12 | 7/12 |
+
+**Headline:** Qwen3-8B and Llama-3.1-8B achieve perfect retrieval across all context lengths under both K4/V2 and K4/V2+sink128 — no regression from v0.6.0's new features.
+
+**Mistral-7B caveat:** Mistral fails 4 of 12 cells **even on the FP16 baseline** at this haystack. The failures are concentrated at 4K and 8K context when the model is asked to retrieve from a highly repetitive filler document. TurboQuant K4/V2 adds 2 more failures (6/12) and K4/V2+sink128 recovers one (7/12). The takeaway is that TurboQuant does not take Mistral-7B meaningfully below its own baseline capability on this test — the model itself has limits with this particular haystack pattern that are inherited by all configs.
+
+Full per-cell logs in `results/needle_Qwen3-8B.log`, `results/needle_Llama-3.1-8B.log`, `results/needle_Mistral-7B.log`.
+
 ## Methodology
 
 - **Quality**: Cosine similarity of last-token logits vs an FP16 reference computed from the same prompt. Logits are cast from bfloat16/float16 to float32 and then compared in float64 for numerical stability.

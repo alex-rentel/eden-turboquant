@@ -1,0 +1,60 @@
+Loading mlx-community/Mistral-7B-Instruct-v0.3-4bit...
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 174762.67it/s]
+Loaded in 0.9s
+
+  config: baseline (FP16)
+     context  position   result  answer
+        1024       0.1     PASS  'mango-sunset-42</s>'                                          (2.7s)
+        1024       0.5     PASS  'mango-sunset-42</s>'                                          (2.7s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (2.9s)
+        2048       0.1     PASS  'mango-sunset-42</s>'                                          (5.5s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (5.7s)
+        2048       0.9     FAIL  'The secret password for the vault is not provided in the tex' (5.9s)
+        4096       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'"       (11.3s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (11.3s)
+        4096       0.9     FAIL  'The secret password for the vault is not specified in the te' (11.3s)
+        8192       0.1     PASS  'The secret password for the vault is "mango-sunset-42".'      (24.3s)
+        8192       0.5     FAIL  'The secret password for the vault is a secret information or' (24.5s)
+        8192       0.9     FAIL  'The password for the vault is a secret, and latitude.'        (24.2s)
+    -> 8/12 pass
+
+  config: k4v2 (v0.5.0 default)
+     context  position   result  answer
+        1024       0.1     PASS  'mango-sunset-42</s>'                                          (3.4s)
+        1024       0.5     PASS  'mango-sunset-42</s>'                                          (3.4s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (3.6s)
+        2048       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (7.2s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (7.2s)
+        2048       0.9     FAIL  'The secret password for the Vault is not provided in the tex' (7.5s)
+        4096       0.1     FAIL  'The secret password for the vault is not specified in the pr' (14.1s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (14.1s)
+        4096       0.9     FAIL  'The secret password for the vault is a secure, encrypted sto' (14.5s)
+        8192       0.1     FAIL  'The secret password for the vault is a secret code that is u' (31.7s)
+        8192       0.5     FAIL  'The weather in various cities across the world varies greatl' (31.6s)
+        8192       0.9     FAIL  'The weather in various cities across the world varies greatl' (31.7s)
+    -> 6/12 pass
+
+  config: k4v2_sink128 (v0.6.0 best)
+     context  position   result  answer
+        1024       0.1     PASS  'mango-sunset-42</s>'                                          (3.4s)
+        1024       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (3.6s)
+        1024       0.9     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (3.6s)
+        2048       0.1     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (7.2s)
+        2048       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'.</s>"  (7.2s)
+        2048       0.9     PASS  "The secret password for the Vault is 'mango-sunset-42'.</s>"  (7.2s)
+        4096       0.1     FAIL  'The secret password for the vault is not provided in the que' (13.9s)
+        4096       0.5     PASS  "The secret password for the vault is 'mango-sunset-42'."      (14.1s)
+        4096       0.9     FAIL  'The secret password for the vault is a secure, encrypted sto' (14.5s)
+        8192       0.1     FAIL  'The secret password for the vault is a secret code used by t' (31.7s)
+        8192       0.5     FAIL  ''                                                             (30.4s)
+        8192       0.9     FAIL  ''                                                             (30.4s)
+    -> 7/12 pass
+
+======================================================================
+Summary
+======================================================================
+  baseline                          8/12
+  k4v2                              6/12
+  k4v2_sink128                      7/12
+
+  k4v2_sink128 did NOT achieve 12/12 — regression!
