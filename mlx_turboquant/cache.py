@@ -114,8 +114,55 @@ class TurboQuantKVCache:
         self._decompressed_values_cache: Optional[mx.array] = None
         self._decompressed_valid: bool = False
 
+        # v0.8.0: fused attention mode. When True, update_and_fetch
+        # returns sink + residual keys only (no decompressed middle)
+        # and the patched SDPA uses the packed state directly via
+        # get_fused_state(). V is still fully dequantized — we do not
+        # fuse V in v0.8.0.
+        self._use_fused_attention: bool = False
+
         # Sequence offset (total tokens seen so far)
         self.offset: int = 0
+
+    # ------------------------------------------------------------------
+    # v0.8.0 fused attention accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def has_compressed(self) -> bool:
+        """True if there are any compressed tokens available for fused QK."""
+        return self._compressed_len > 0
+
+    def get_fused_state(self) -> dict:
+        """Return the packed state needed by the fused SDPA path.
+
+        The patched scaled_dot_product_attention reads this dict to
+        run fused_qk_scores_*_batched against the compressed region
+        without ever materializing dequantized K.
+
+        Returns:
+            dict with:
+              packed_keys: (B, H_kv, T_compressed, packed_dim) uint8
+              key_norms:   (B, H_kv, T_compressed) float32
+              key_centroids: (2^bits,) float32  — None if fractional
+              rotation:    (D, D) float32
+              key_bits:    int
+              sink_len:    int — number of tokens pinned in sink (positions 0..sink_len)
+              compressed_len: int — number of compressed tokens
+              fp16_len:    int — number of residual FP16 tokens
+              head_dim:    int
+        """
+        return {
+            "packed_keys": self._compressed_keys,
+            "key_norms": self._compressed_key_norms,
+            "key_centroids": self.k_centroids,
+            "rotation": self.rotation,
+            "key_bits": int(self.key_bits),
+            "sink_len": self._sink_len,
+            "compressed_len": self._compressed_len,
+            "fp16_len": self._fp16_len,
+            "head_dim": self.head_dim,
+        }
 
     @property
     def state(self):
@@ -640,13 +687,27 @@ class TurboQuantKVCache:
         if self._compressed_len > 0 and not self._decompressed_valid:
             self._rebuild_decompressed_cache()
 
+        # In fused attention mode (v0.8.0), we skip materializing the
+        # decompressed middle for KEYS — the patched SDPA will read the
+        # packed state directly via get_fused_state(). Values are still
+        # fully dequantized because v0.8.0 does not fuse V.
+        #
+        # But only skip the middle when this is a decode step (T_total == 1):
+        # the fused SDPA path only handles T_q=1 in v0.8.0 and falls through
+        # to the original wrapper for prefill. Returning sparse keys during
+        # prefill would break the fallback because keys and values would have
+        # mismatched sequence lengths.
+        skip_compressed_middle = (
+            self._use_fused_attention and T_total == 1
+        )
         parts_k = []
         parts_v = []
         if self._sink_len > 0:
             parts_k.append(self.sink_keys[:, :, :self._sink_len, :])
             parts_v.append(self.sink_values[:, :, :self._sink_len, :])
         if self._compressed_len > 0:
-            parts_k.append(self._decompressed_keys_cache)
+            if not skip_compressed_middle:
+                parts_k.append(self._decompressed_keys_cache)
             parts_v.append(self._decompressed_values_cache)
         if self._fp16_len > 0:
             parts_k.append(self.keys[:, :, :self._fp16_len, :])

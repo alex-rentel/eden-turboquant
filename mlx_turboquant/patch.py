@@ -143,6 +143,7 @@ def apply_turboquant(
     chunk_size: int = 0,
     qjl_correction: bool = False,
     qjl_n_proj: int = 32,
+    use_fused_attention: bool = False,
 ) -> nn.Module:
     """Apply TurboQuant KV cache compression to an mlx-lm model.
 
@@ -179,6 +180,15 @@ def apply_turboquant(
         qjl_n_proj: Number of QJL random projections (only used when
             qjl_correction=True). Higher = more accurate correction at
             slightly more compute. Default 32.
+        use_fused_attention: v0.8.0 opt-in. When True, installs a fused
+            scaled_dot_product_attention patch on supported mlx-lm model
+            modules (qwen3, llama, qwen2, phi3, deepseek_v2, deepseek_v3).
+            At decode time with a TurboQuantKVCache and compressed tokens,
+            attention scores for the compressed region are computed
+            directly from packed indices via fused_qk_scores_4bit_batched,
+            skipping the per-step dequantization of K. Only supports
+            key_bits=4 and the T_q=1 decode case in v0.8.0; falls through
+            to the standard path otherwise. Default False.
 
     Returns:
         The same model (modified in-place)
@@ -288,7 +298,7 @@ def apply_turboquant(
             elif i in layers_to_skip:
                 caches.append(KVCache())  # FP16 for outlier layers
             else:
-                caches.append(TurboQuantKVCache(
+                tq_cache = TurboQuantKVCache(
                     head_dim=hd,
                     num_kv_heads=nkv,
                     key_bits=key_bits,
@@ -299,11 +309,23 @@ def apply_turboquant(
                     chunk_size=chunk_size,
                     qjl_correction=qjl_correction,
                     qjl_n_proj=qjl_n_proj,
-                ))
+                )
+                tq_cache._use_fused_attention = use_fused_attention
+                caches.append(tq_cache)
         return caches
 
     # Monkey-patch
     model.make_cache = make_cache
+
+    # v0.8.0: install the fused scaled_dot_product_attention patch into
+    # supported model modules. This is idempotent (safe to call even if
+    # another model is already patched) and only affects model classes
+    # whose attention layers go through the shared mlx_lm.models.base
+    # SDPA wrapper. When use_fused_attention=False (default), we skip
+    # installation entirely — zero-cost opt-in.
+    if use_fused_attention:
+        from .fused_sdpa import install_patch
+        install_patch()
 
     # Store config for introspection
     model._turboquant_config = {
