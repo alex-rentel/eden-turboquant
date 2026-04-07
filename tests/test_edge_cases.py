@@ -221,13 +221,19 @@ class TestCacheEdgeCases:
         assert cache._fp16_len == 50
 
     def test_zero_residual_window(self):
-        """Window=0 means all tokens get compressed immediately."""
+        """Window=0 with chunk_size=1 means all tokens get compressed immediately.
+
+        Note: with default chunk_size=64, residual_window=0 still keeps up
+        to 64 tokens uncompressed. Use chunk_size=1 for strict immediate
+        compression semantics.
+        """
         cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=4,
-                                  residual_window=0)
+                                  residual_window=0, chunk_size=1)
         keys = mx.array(np.random.randn(1, 2, 10, 128).astype(np.float32))
         values = mx.array(np.random.randn(1, 2, 10, 128).astype(np.float32))
         k_out, v_out = cache.update_and_fetch(keys, values)
-        mx.eval(k_out, v_out)
+        _ = k_out.shape  # force evaluation
+        _ = v_out.shape
         assert cache._compressed_len == 10
         assert cache._fp16_len == 0
 

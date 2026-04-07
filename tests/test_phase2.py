@@ -82,21 +82,29 @@ class TestTurboQuantKVCacheBasic:
             assert k_out.shape[2] == 100 + i + 1
 
     def test_residual_window_fp16(self):
-        """Recent tokens within residual window should stay in FP16."""
-        window = 32
-        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
-                                  residual_window=window)
+        """Recent tokens within residual window should stay in FP16.
 
-        # Add 100 tokens
+        With chunked compression, the FP16 buffer holds between
+        `residual_window` and `residual_window + chunk_size` tokens at any
+        time, and `_fp16_len + _compressed_len == offset` always.
+        """
+        window = 32
+        chunk = 64
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=window, chunk_size=chunk)
+
         keys = mx.array(np.random.randn(1, 2, 100, 128).astype(np.float32))
         values = mx.array(np.random.randn(1, 2, 100, 128).astype(np.float32))
         cache.update_and_fetch(keys, values)
-        mx.eval(cache.keys, cache.values)
 
-        # FP16 buffer should only have `window` tokens
-        assert cache._fp16_len == window
-        # Compressed storage should have the rest
-        assert cache._compressed_len == 100 - window
+        # Bounded invariant: residual buffer holds at least `window` and
+        # at most `window + chunk - 1` tokens after compression drains.
+        assert cache._fp16_len >= window
+        assert cache._fp16_len < window + chunk
+        # Total accounting must always equal offset
+        assert cache._fp16_len + cache._compressed_len == cache.offset == 100
+        # Some compression must have happened
+        assert cache._compressed_len > 0
 
     def test_residual_window_exact_values(self):
         """Recent tokens in FP16 should be bit-exact (not compressed)."""
@@ -164,6 +172,57 @@ class TestTurboQuantKVCacheBasic:
             k_out, v_out = cache.update_and_fetch(keys, values)
             mx.eval(k_out, v_out)
             assert k_out.shape == (1, 2, 20, d)
+
+
+class TestChunkedCompression:
+    """Tests for fixed-size chunk_size compression draining."""
+
+    def test_default_chunk_size(self):
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2)
+        assert cache.chunk_size == 64
+
+    def test_chunks_drained_in_fixed_size(self):
+        """After a large prefill, FP16 buffer holds [window, window+chunk)."""
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=32, chunk_size=64)
+        # Prefill 300 tokens — should drain (300 - 32) // 64 = 4 chunks of 64
+        keys = mx.array(np.random.randn(1, 2, 300, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        assert cache._compressed_len == 4 * 64  # 256
+        assert cache._fp16_len == 300 - 256     # 44
+        assert 32 <= cache._fp16_len < 32 + 64
+
+    def test_drain_loops_for_multi_chunk_input(self):
+        """A single huge update should drain multiple chunks in one call."""
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=16, chunk_size=32)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        # Expected drained chunks: while fp16_len >= 16+32 = 48, drain 32.
+        # After 200 tokens: drain until fp16_len < 48 → fp16_len lands in [16, 48)
+        n_drained = (200 - 16) // 32  # 5
+        assert cache._compressed_len == n_drained * 32  # 160
+        assert cache._fp16_len == 200 - 160              # 40
+
+    def test_custom_chunk_size_smaller(self):
+        """Smaller chunks compress more frequently in finer steps."""
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=16, chunk_size=8)
+        keys = mx.array(np.random.randn(1, 2, 100, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        # Should drain (100 - 16) // 8 = 10 chunks of 8 → 80 compressed, 20 in FP16
+        assert cache._compressed_len == 80
+        assert cache._fp16_len == 20
+
+    def test_no_compression_below_threshold(self):
+        """Small prefill (< window + chunk) should not compress at all."""
+        cache = TurboQuantKVCache(head_dim=128, key_bits=4, value_bits=2,
+                                  residual_window=64, chunk_size=64)
+        keys = mx.array(np.random.randn(1, 2, 100, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        # 100 < 64 + 64 = 128, so no compression
+        assert cache._compressed_len == 0
+        assert cache._fp16_len == 100
 
 
 class TestAttentionSink:

@@ -140,6 +140,7 @@ def apply_turboquant(
     skip_layers: Optional[list[int]] = None,
     auto_detect_outliers: bool = True,
     fp16_sink_size: int = 0,
+    chunk_size: int = 64,
 ) -> nn.Module:
     """Apply TurboQuant KV cache compression to an mlx-lm model.
 
@@ -160,6 +161,9 @@ def apply_turboquant(
         fp16_sink_size: Number of leading tokens (e.g., system prompt) to
             permanently store in FP16. These never get compressed and are
             independent of `residual_window`. 0 disables the sink (default).
+        chunk_size: Number of tokens compressed per drain operation. Fixed
+            chunk sizes give Metal kernels stable input shapes, improving
+            kernel template caching. Default 64.
 
     Returns:
         The same model (modified in-place)
@@ -211,6 +215,7 @@ def apply_turboquant(
                     residual_window=residual_window,
                     rotation_seed=rotation_seed,
                     fp16_sink_size=fp16_sink_size,
+                    chunk_size=chunk_size,
                 ))
         return caches
 
@@ -226,6 +231,7 @@ def apply_turboquant(
         "value_bits": value_bits,
         "residual_window": residual_window,
         "fp16_sink_size": fp16_sink_size,
+        "chunk_size": chunk_size,
     }
 
     return model
