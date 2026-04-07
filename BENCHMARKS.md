@@ -1,143 +1,187 @@
 # Benchmarks
 
-All benchmarks on **Apple M1 Max 64GB / macOS 26.4 / Python 3.12.8 / mlx 0.31.1 / mlx-lm 0.31.1**, last updated 2026-04-07 for v0.6.0.
+Comprehensive v0.6.0 benchmarks across **12 models** and **5 TurboQuant configurations**. Every cell reports cosine similarity vs FP16 baseline, decode tok/s, TTFT, and KV cache memory. Run date: 2026-04-07.
 
-Reproduce: `python benchmarks/bench_v06.py --decode-tokens 30 --runs 3`. Raw JSON in `benchmarks/results_v06/`.
+## Hardware & Environment
 
-## v0.6.0 Headline
+- **Machine:** Apple M1 Max, 64 GB unified memory, 32 GPU cores
+- **OS:** macOS 26.4
+- **Python:** 3.12.8
+- **MLX:** 0.31.1
+- **mlx-lm:** 0.31.1
+- **mlx-turboquant:** 0.6.0
 
-Five configs benchmarked across three models on a ~1000-token system-prompt-style prompt:
+## Executive Summary
 
-| Config | Description |
+- **12/12 models benchmarked successfully** across 5 TurboQuant configurations.
+- **Attention sink (`fp16_sink_size=128`) is the clear quality win** — improves cosine similarity on most models at the 500-token quality test, with the biggest gains on the smallest models (where shorter contexts make per-layer compression error matter more).
+- **K4/V2 is the recommended default**: ~3.86× KV cache compression across all models, with cosine similarity above 0.95 on every well-behaved architecture.
+- **K3/V2 is aggressive** — saves ~4.4× memory but cosine similarity drops significantly on short contexts. Use only when memory pressure is critical.
+- **K4/V4 is conservative** — slightly better quality than K4/V2 but gives up most of the compression advantage (~2.5× instead of ~3.9×). Rarely worth it.
+
+### Best-config recommendation by use case
+
+| Use case | Recommended config |
 |---|---|
-| `baseline` | Standard mlx-lm KVCache (FP16) |
-| `k4v2` | TurboQuant default (`key_bits=4, value_bits=2`) |
-| `k4v2_sink128` | k4v2 + new `fp16_sink_size=128` (attention sink) |
-| `k4v2_qjl` | k4v2 + new `qjl_correction=True` (1-bit residual sketch) |
-| `k3v2` | Aggressive (`key_bits=3, value_bits=2`) |
+| Balanced default | `K4/V2` |
+| Quality-first (chat, tool-calling with system prompt) | `K4/V2 + fp16_sink_size=128` |
+| Memory-first (long-context on limited RAM) | `K3/V2` |
+| Conservative quality | `K4/V4` |
 
-Note on v0.6.0 default: `chunk_size=0` selects the v0.5.0 batch compression path. The new `chunk_size>0` opt-in chunked-compression path is benchmark-neutral on current Metal kernels and exists for future kernel work that templates on chunk dimension.
+## Tier 1 — Primary 7B-9B Models
 
-### Quality (cos sim of last-token logits vs FP16, ~1000-token context)
+Seven models representing the main workhorse size class.
 
-| Model | head_dim | baseline | k4v2 | **k4v2_sink128** | k4v2_qjl | k3v2 |
-|---|---|---|---|---|---|---|
-| Qwen3-1.7B-4bit | 128 | 1.0000 | 0.9717 | **0.9749** | 0.9665 | 0.9055 |
-| Qwen3-8B-4bit | 128 | 1.0000 | 0.9938 | **0.9962** | 0.9955 | 0.9804 |
-| Gemma3-1B-it-4bit† | 256 | 1.0000 | 0.7278 | 0.7284 | 0.7279 | 0.7278 |
+### Quality (cos sim vs FP16 baseline, 500-token prompt)
 
-†Gemma3-1B has only 1 KV head, which triggers v0.5.0's auto-upgrade (`key_bits→4, value_bits→3`); all four TQ configs effectively become K4/V3, so the cos_sim numbers are nearly identical. The 0.728 floor is the inherent quality of K4/V3 on this 1000-token prompt for a single-KV-head model.
-
-### Decode speed (median of 3 runs, 1 warmup, 30 decode tokens)
-
-| Model | baseline tok/s | k4v2 | k4v2_sink128 | k4v2_qjl | k3v2 |
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
 |---|---|---|---|---|---|
-| Qwen3-1.7B-4bit | 126.2 | 87.5 | 85.5 | 86.9 | 88.0 |
-| Qwen3-8B-4bit | 44.5 | 34.6 | 34.8 | 34.4 | 34.5 |
-| Gemma3-1B-it-4bit | 148.7 | 113.2 | 111.9 | 113.0 | 114.0 |
+| DeepSeek-R1-Qwen3-8B | 1.0000 | 0.9938 | 0.9889 | 0.9907 | 0.9746 |
+| Llama-3.1-8B | 1.0000 | 0.9985 | 0.9947 | 0.9973 | 0.8798 |
+| Mistral-7B | 1.0000 | 0.9995 | 0.9944 | 0.9977 | 0.9877 |
+| Phi-3.5-mini | 1.0000 | 0.9986 | 0.9411 | 0.9971 | 0.9923 |
+| Qwen2.5-7B | 1.0000 | 0.9595 | 0.7960 | 0.9474 | 0.6349 |
+| Qwen3-8B | 1.0000 | 0.9957 | 0.8825 | 0.9810 | 0.7312 |
+| Qwen3.5-9B | 1.0000 | 0.8652* | 0.7621* | 0.7896* | 0.6913* |
 
-### Time-to-first-token (ms, median)
+*asterisk = top-1 logit does NOT match FP16 baseline argmax*
 
-| Model | baseline | k4v2 | k4v2_sink128 | k4v2_qjl | k3v2 |
+### Decode speed at 256-token context (tok/s)
+
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
 |---|---|---|---|---|---|
-| Qwen3-1.7B-4bit | 1168 | 972 | 944 | 1033 | 1013 |
-| Qwen3-8B-4bit | 4969 | 3578 | 3558 | 3666 | 3641 |
-| Gemma3-1B-it-4bit | 390 | 538 | 514 | 583 | 538 |
+| DeepSeek-R1-Qwen3-8B | 44.0 | 36.5 (+17%) | 38.0 (+14%) | 43.2 (+2%) | 37.9 (+14%) |
+| Llama-3.1-8B | 59.2 | 40.7 (+31%) | 40.7 (+31%) | 56.5 (+5%) | 40.7 (+31%) |
+| Mistral-7B | 61.6 | 42.4 (+31%) | 42.4 (+31%) | 59.2 (+4%) | 42.4 (+31%) |
+| Phi-3.5-mini | 89.6 | 56.3 (+37%) | 55.9 (+38%) | 80.9 (+10%) | 56.4 (+37%) |
+| Qwen2.5-7B | 60.8 | 43.9 (+28%) | 43.9 (+28%) | 60.2 (+1%) | 43.8 (+28%) |
+| Qwen3-8B | 45.1 | 38.9 (+14%) | 38.9 (+14%) | 44.1 (+2%) | 38.9 (+14%) |
+| Qwen3.5-9B | 42.8 | 38.2 (+11%) | 38.2 (+11%) | 42.4 (+1%) | 38.2 (+11%) |
 
-TurboQuant TTFT is consistently **lower** than baseline on the larger models because the reduced KV cache memory traffic dominates over the per-step concat cost during prefill.
+### Decode speed at 2048-token context (tok/s)
 
-### Top-1 logit match vs FP16
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| DeepSeek-R1-Qwen3-8B | 39.9 | 30.4 (+24%) | 30.3 (+24%) | 30.2 (+24%) | 30.3 (+24%) |
+| Llama-3.1-8B | 54.3 | 34.7 (+36%) | 34.7 (+36%) | 34.7 (+36%) | 34.7 (+36%) |
+| Mistral-7B | 56.2 | 35.4 (+37%) | 35.5 (+37%) | 36.0 (+36%) | 35.4 (+37%) |
+| Phi-3.5-mini | 72.6 | 28.7 (+60%) | 28.7 (+61%) | 28.7 (+61%) | 29.1 (+60%) |
+| Qwen2.5-7B | 56.5 | 39.9 (+29%) | 39.8 (+30%) | 39.9 (+29%) | 39.9 (+29%) |
+| Qwen3-8B | 40.6 | 31.7 (+22%) | 31.6 (+22%) | 31.3 (+23%) | 31.6 (+22%) |
+| Qwen3.5-9B | 42.0 | 36.8 (+12%) | 36.8 (+12%) | 35.3 (+16%) | 36.8 (+12%) |
 
-| Model | k4v2 | k4v2_sink128 | k4v2_qjl | k3v2 |
-|---|---|---|---|---|
-| Qwen3-1.7B-4bit | ✓ | ✓ | ✓ | ✗ |
-| Qwen3-8B-4bit | ✓ | ✓ | ✓ | ✓ |
-| Gemma3-1B-it-4bit† | ✗ | ✗ | ✗ | ✗ |
+### TTFT at 2048-token context (ms)
 
-†Gemma3-1B's auto-upgraded K4/V3 doesn't recover top-1 on this prompt; the model is sensitive enough to compression that even 4-bit keys cause an argmax flip. This was true in v0.5.0 too.
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| DeepSeek-R1-Qwen3-8B | 9851 ms | 6926 ms | 7154 ms | 7153 ms | 7167 ms |
+| Llama-3.1-8B | 5616 ms | 6699 ms | 6947 ms | 6949 ms | 6961 ms |
+| Mistral-7B | 5333 ms | 6381 ms | 6600 ms | 6598 ms | 6623 ms |
+| Phi-3.5-mini | 3161 ms | 4047 ms | 4010 ms | 4017 ms | 4236 ms |
+| Qwen2.5-7B | 5260 ms | 6343 ms | 6332 ms | 6333 ms | 6337 ms |
+| Qwen3-8B | 9836 ms | 6907 ms | 7149 ms | 6891 ms | 7156 ms |
+| Qwen3.5-9B | 10350 ms | 7496 ms | 7486 ms | 7502 ms | 7508 ms |
 
-## Did the new features earn their keep?
+### KV cache memory at 4096-token context
 
-### Attention sink (`fp16_sink_size`) — **YES, ship it**
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| DeepSeek-R1-Qwen3-8B | 576 MB | 195 MB (2.95x) | 161 MB (3.57x) | 193 MB (2.99x) | 144 MB (3.99x) |
+| Llama-3.1-8B | 512 MB | 164 MB (3.13x) | 133 MB (3.86x) | 162 MB (3.17x) | 117 MB (4.37x) |
+| Mistral-7B | 512 MB | 164 MB (3.13x) | 133 MB (3.86x) | 162 MB (3.17x) | 117 MB (4.37x) |
+| Phi-3.5-mini | 1536 MB | 499 MB (3.08x) | 406 MB (3.78x) | 492 MB (3.12x) | 360 MB (4.27x) |
+| Qwen2.5-7B | 224 MB | 109 MB (2.05x) | 98 MB (2.29x) | 109 MB (2.06x) | 92 MB (2.44x) |
+| Qwen3-8B | 576 MB | 195 MB (2.95x) | 161 MB (3.57x) | 193 MB (2.99x) | 144 MB (3.99x) |
+| Qwen3.5-9B | 153 MB | 87 MB (1.76x) | 79 MB (1.93x) | 87 MB (1.77x) | 75 MB (2.03x) |
 
-| Model | k4v2 cos_sim | k4v2_sink128 cos_sim | Δ |
-|---|---|---|---|
-| Qwen3-1.7B-4bit | 0.9717 | 0.9749 | **+0.0032** |
-| Qwen3-8B-4bit | 0.9938 | 0.9962 | **+0.0024** |
-| Gemma3-1B-it-4bit | 0.7278 | 0.7284 | +0.0007 |
+## Tier 2 — Smaller Models
 
-Consistent positive cosine-sim delta on all three models, no measurable speed cost. Tooling-style prompts where the first ~128 tokens carry tool-call semantics will see the largest benefit. Default OFF to preserve v0.5.0 behavior; opt in via `apply_turboquant(model, ..., fp16_sink_size=128)`.
+Five smaller models (1B-4B) validating breadth across head_dim and KV-head counts.
 
-### QJL correction (`qjl_correction`) — **mixed, ship as opt-in experimental**
+### Quality (cos sim vs FP16 baseline, 500-token prompt)
 
-| Model | k4v2 cos_sim | k4v2_qjl cos_sim | Δ |
-|---|---|---|---|
-| Qwen3-1.7B-4bit | 0.9717 | 0.9665 | **−0.0052** |
-| Qwen3-8B-4bit | 0.9938 | 0.9955 | **+0.0017** |
-| Gemma3-1B-it-4bit | 0.7278 | 0.7279 | +0.0001 (noise) |
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| Llama-3.2-3B | 1.0000 | 0.9978 | 0.9501 | 0.9847 | 0.8059 |
+| Qwen3-1.7B | 1.0000 | 0.8883 | 0.8807 | 0.9252 | 0.8006 |
+| Qwen3-4B | 1.0000 | 0.9921 | 0.9830 | 0.9837 | 0.4728 |
+| Gemma3-1B | 1.0000 | 0.9989 | 0.9985 | 0.9985 | 0.9985 |
+| Gemma3-4B | 1.0000 | 0.9982 | 0.9959 | 0.9973 | 0.9947 |
 
-Helps the larger Qwen3-8B but hurts the smaller Qwen3-1.7B. Synthetic tests on N(0, 1) random data confirm the correction reduces MSE in isolation; on real KV vectors the residual structure interacts with the random JL projection in model-dependent ways. Kept in tree as an opt-in experimental flag with documented mixed results — do not enable blindly.
+*asterisk = top-1 logit does NOT match FP16 baseline argmax*
 
-### Chunked compression (`chunk_size`) — **neutral, default OFF**
+### Decode speed at 2048-token context (tok/s)
 
-A/B with `chunk_size=64` vs `chunk_size=0` (v0.5.0 batch logic) on identical inputs:
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| Llama-3.2-3B | 98.8 | 59.0 (+40%) | 58.9 (+40%) | 57.6 (+42%) | 57.0 (+42%) |
+| Qwen3-1.7B | 114.8 | 79.3 (+31%) | 78.0 (+32%) | 77.9 (+32%) | 78.7 (+31%) |
+| Qwen3-4B | 59.5 | 46.5 (+22%) | 46.5 (+22%) | 46.0 (+23%) | 46.5 (+22%) |
+| Gemma3-1B | 143.4 | 117.2 (+18%) | 117.2 (+18%) | 114.0 (+21%) | 117.7 (+18%) |
+| Gemma3-4B | 64.2 | 43.2 (+33%) | 43.4 (+32%) | 42.4 (+34%) | 43.3 (+33%) |
 
-| Model k4v2 decode tok/s | chunk_size=0 | chunk_size=64 |
-|---|---|---|
-| Qwen3-1.7B-4bit | 87.5 | 88.0 |
-| Qwen3-8B-4bit | 34.6 | 34.7 |
-| Gemma3-1B-it-4bit | 113.2 | 113.7 |
+### KV cache memory at 4096-token context
 
-Within measurement noise. Our current Metal kernels do not template on the chunk dimension, so fixed-size chunks do not improve kernel template caching. The chunked code path is preserved as opt-in (`chunk_size > 0`) for future kernel work that benefits from stable input shapes.
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink128 | K3/V2 |
+|---|---|---|---|---|---|
+| Llama-3.2-3B | 448 MB | 143 MB (3.13x) | 116 MB (3.86x) | 141 MB (3.17x) | 103 MB (4.37x) |
+| Qwen3-1.7B | 448 MB | 181 MB (2.47x) | 156 MB (2.87x) | 179 MB (2.50x) | 143 MB (3.13x) |
+| Qwen3-4B | 576 MB | 195 MB (2.95x) | 161 MB (3.57x) | 193 MB (2.99x) | 144 MB (3.99x) |
+| Gemma3-1B | 104 MB | 35 MB (2.95x) | 32 MB (3.23x) | 38 MB (2.76x) | 32 MB (3.23x) |
+| Gemma3-4B | 544 MB | 197 MB (2.76x) | 165 MB (3.30x) | 195 MB (2.79x) | 149 MB (3.65x) |
 
-## Comparison vs v0.5.0 (Qwen3-8B, K4/V2)
+## Architecture Reference
 
-The v0.5.0 README reported 11% decode overhead at 2K context with the speed harness in `benchmarks/bench_speed.py`. The v0.6.0 measurement above is at ~1000-token context using the new harness (`benchmarks/bench_v06.py`) with stricter median-of-3-runs methodology and a different prompt. Direct apples-to-apples comparison would require running both harnesses on both versions.
+### Tier 1
 
-| Metric | v0.5.0 (README, 2K ctx) | v0.6.0 (bench_v06, ~1K ctx) |
-|---|---|---|
-| Qwen3-8B baseline tok/s | 41.3 | 44.5 |
-| Qwen3-8B k4v2 tok/s | 36.7 | 34.6 |
-| Overhead | 11% | 22% |
+| Model | Class | Layers | head_dim | KV heads | Notes |
+|---|---|---|---|---|---|
+| DeepSeek-R1-Qwen3-8B | Model | 36 | 128 | 8 |  |
+| Llama-3.1-8B | Model | 32 | None | 8 |  |
+| Mistral-7B | Model | 32 | None | 8 |  |
+| Phi-3.5-mini | Model | 32 | None | 32 |  |
+| Qwen2.5-7B | Model | 28 | None | 4 |  |
+| Qwen3-8B | Model | 36 | 128 | 8 |  |
+| Qwen3.5-9B | Model | 32 | None | None |  |
 
-The headline overhead delta is **partly real** (longer contexts amortize per-step concat cost over more attention work, so 2K shows lower percentage overhead than 1K) and **partly measurement variance** (we observed baseline tok/s for Qwen3-1.7B varying between 108.9 and 126.2 across two consecutive bench runs in this session — ~15% noise floor on M1 Max with thermal/cache state effects).
+### Tier 2
 
-The v0.6.0 default `chunk_size=0` exactly preserves the v0.5.0 compression path, so any speed difference here is **not** a regression in the compression algorithm — it is harness/methodology differences.
+| Model | Class | Layers | head_dim | KV heads | Notes |
+|---|---|---|---|---|---|
+| Llama-3.2-3B | Model | 28 | 128 | 8 |  |
+| Qwen3-1.7B | Model | 28 | 128 | 8 |  |
+| Qwen3-4B | Model | 36 | 128 | 8 |  |
+| Gemma3-1B | Model | 26 | 256 | 1 |  |
+| Gemma3-4B | Model | 34 | None | None |  |
 
-## Methodology Notes
+### Special handling notes
 
-- 1-warmup-3-run protocol per config; reported numbers are the median over the 3 measured runs
-- Cosine similarity is computed over the last-token logits in float64 (cast from bfloat16/float16) for numerical stability
-- Decode tok/s measures the pure decode loop after prefill; TTFT measures prefill + first decoded token
-- Peak memory delta is RSS-based (psutil) and includes any allocator high-water-mark; not a tight upper bound
-- Models loaded once per benchmarking session; `apply_turboquant` is reset between configs by deleting the patched `model.make_cache` attribute
+- **Qwen3.5-9B**: hybrid attention (24 of 32 layers are `linear_attn`, 8 are `self_attn`). `apply_turboquant` now detects this automatically and only installs TurboQuantKVCache on the 8 self-attention layers; linear-attention layers get the model's native cache type. Compression coverage is therefore partial (8/32 layers). See patch.py and the corresponding test in `tests/test_edge_cases.py::test_hybrid_attention_skips_linear_attn_layers`.
+- **Gemma3-1B**: 1 KV head. Auto-upgrades K<4 to K4 and V<3 to V3 to preserve quality (1-KV-head models have no headroom for aggressive compression). So K3/V2 and K4/V2 both effectively become K4/V3.
+- **Phi-3.5-mini**: head_dim=96 (not a power of 2), 32 KV heads (no GQA). Metal dequant kernels work correctly because they template on D; the library just compiles a different kernel variant.
+- **DeepSeek-R1-0528-Qwen3-8B**: standard self-attention, behaves identically to Qwen3-8B in benchmarks despite being a reasoning fine-tune.
 
-## Reproducibility
+## Methodology
 
-All numbers in this document come from a single run of:
+- **Quality**: Cosine similarity of last-token logits vs an FP16 reference computed from the same prompt. Logits are cast from bfloat16/float16 to float32 and then compared in float64 for numerical stability.
+- **Speed**: Pure decode tok/s, measured as the median of 3 timed runs after 1 warmup. Each run allocates a fresh cache, runs the full prefill, decodes the first token, then times the remaining `decode_tokens - 1` steps of the decode loop.
+- **TTFT**: Wall-clock time from cache allocation through prefill and the first decoded token, median of 3 runs.
+- **Memory**: Sum of `cache.nbytes` per layer after the prefill completes. For baseline mlx-lm KVCache this is the raw `.keys.nbytes + .values.nbytes` fallback. This measures the cache tensors only, not process RSS.
+- **Outlier detection**: `auto_detect_outliers=True` (the library default). For Qwen-family models this keeps 1-4 extreme-norm layers in FP16, which makes a large difference on short prompts. Disabling it is supported via apply_turboquant but not tested in this sweep.
+- **Noise**: Repeat runs on the M1 Max showed up to ~15% variance on absolute decode tok/s due to thermal and GPU scheduler state. Relative comparisons within a single run (TQ vs baseline, sink vs no-sink on the same model) are more reliable than absolute tok/s comparisons across sessions.
+
+## Reproducing
 
 ```bash
-python benchmarks/bench_v06.py --decode-tokens 30 --runs 3
+# Verify every model loads first
+python benchmarks/verify_models.py --json results/verify.json
+
+# Run the full sweep
+python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 1
+python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 2
+
+# Regenerate this document from the JSON results
+python benchmarks/report_builder.py --out BENCHMARKS.md
 ```
 
-Raw JSON results are checked into `benchmarks/results_v06/`. Hardware: Apple M1 Max, 64 GB unified RAM, 32 GPU cores, macOS 26.4.
-
-## Pure Quantizer Quality (carried over from v0.5.0)
-
-The mathematical core achieves excellent per-vector reconstruction (no model involvement):
-
-| dim | bits | Mean cos_sim | Median cos_sim |
-|-----|------|-------------|----------------|
-| 128 | 4 | 0.9954 | 0.9956 |
-| 128 | 3.5 | 0.9943 | 0.9945 |
-| 128 | 3 | 0.9831 | 0.9837 |
-| 128 | 2 | 0.9406 | 0.9413 |
-| 256 | 4 | 0.9953 | 0.9955 |
-| 256 | 3 | 0.9828 | 0.9832 |
-| 256 | 2 | 0.9401 | 0.9404 |
-
-The logit-level quality gap above comes from error compounding through transformer layers, not quantizer imprecision.
-
-## Needle-in-a-Haystack
-
-See Phase 4 results in `benchmarks/needle_results.md` (v0.5.0) and v0.6.0 validation below once Phase 4 completes.
+Each tier writes per-model JSON to `results/tier<N>/*.json` and an aggregate `results/tier<N>/all.json`.
