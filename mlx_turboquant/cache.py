@@ -225,6 +225,10 @@ class TurboQuantKVCache:
         if self._compressed_keys is not None:
             total += self._compressed_keys.nbytes + self._compressed_key_norms.nbytes
             total += self._compressed_values.nbytes + self._compressed_value_norms.nbytes
+            if self._compressed_keys_lo is not None:
+                total += self._compressed_keys_lo.nbytes
+            if self._compressed_values_lo is not None:
+                total += self._compressed_values_lo.nbytes
         return total
 
     def _rotate_and_norm(self, tensor: mx.array) -> tuple[mx.array, mx.array, int]:
@@ -307,8 +311,11 @@ class TurboQuantKVCache:
         B, H, T, _ = packed.shape
         D = self.head_dim
 
-        # Try Metal kernel path (fused unpack + centroid + inverse rotation + scale)
-        if bits in (2, 3, 4) and T > 0:
+        # Try Metal kernel path (fused unpack + centroid + inverse rotation + scale).
+        # Failures are sticky: once the kernel fails for this cache instance we
+        # never retry, otherwise the per-token overhead of attempting + failing
+        # accumulates across every decode step.
+        if bits in (2, 3, 4) and T > 0 and not getattr(self, "_metal_dequant_disabled", False):
             try:
                 from .kernels import metal_dequantize
                 flat_packed = packed.reshape(-1, packed.shape[-1])
@@ -318,8 +325,15 @@ class TurboQuantKVCache:
                     self.rotation, bits, D,
                 )
                 return x_hat.reshape(B, H, T, D)
-            except Exception:
-                pass  # Fall through to Python path
+            except Exception as exc:
+                import warnings
+                warnings.warn(
+                    f"metal_dequantize failed ({exc!r}); falling back to "
+                    "Python path for the rest of this cache's lifetime.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._metal_dequant_disabled = True
 
         # Python fallback
         flat_packed = packed.reshape(-1, packed.shape[-1])
@@ -508,10 +522,17 @@ class TurboQuantKVCache:
         """
         old_keys = self.keys[:, :, :n_compress, :]
         old_values = self.values[:, :, :n_compress, :]
-        # Shift remaining to front of pre-allocated buffer
+        # Shift remaining to front of pre-allocated buffer.
+        # The LHS and RHS slices alias the same underlying buffer; force
+        # the RHS to materialize into a separate allocation before the
+        # in-place write so MLX's lazy graph cannot interleave them.
         remaining = self._fp16_len - n_compress
-        self.keys[:, :, :remaining, :] = self.keys[:, :, n_compress:self._fp16_len, :]
-        self.values[:, :, :remaining, :] = self.values[:, :, n_compress:self._fp16_len, :]
+        if remaining > 0:
+            shifted_k = mx.array(self.keys[:, :, n_compress:self._fp16_len, :])
+            shifted_v = mx.array(self.values[:, :, n_compress:self._fp16_len, :])
+            mx.async_eval(shifted_k, shifted_v)
+            self.keys[:, :, :remaining, :] = shifted_k
+            self.values[:, :, :remaining, :] = shifted_v
         self._fp16_len = remaining
 
         # Compress keys and values for this chunk

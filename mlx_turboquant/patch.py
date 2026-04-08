@@ -118,7 +118,13 @@ def detect_outlier_layers(model: nn.Module, threshold: float = 3.0) -> list[int]
             max_norms.append(0.0)
 
     max_norms = np.array(max_norms)
-    median_norm = np.median(max_norms[max_norms > 0])
+    positive = max_norms[max_norms > 0]
+    if positive.size == 0:
+        # No layer produced a positive key norm — nothing reliable to compare
+        # against. Return empty rather than propagating NaN through the
+        # threshold check (which would silently mark every layer as non-outlier).
+        return []
+    median_norm = float(np.median(positive))
 
     outliers = []
     for i, n in enumerate(max_norms):

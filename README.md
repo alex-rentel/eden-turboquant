@@ -118,6 +118,47 @@ The fused kernel computes Q @ K^T directly from packed codebook indices, skippin
 
 Full data in [BENCHMARKS_v07.md](BENCHMARKS_v07.md). Design and math in [docs/FUSED_ATTENTION_DESIGN.md](docs/FUSED_ATTENTION_DESIGN.md).
 
+### Post-patch validation (v0.8.1, April 2026)
+
+After the v0.7.1 bug fixes (nbytes undercount, aliased buffer shift in
+`_drain_chunk`, sticky Metal fallback, NaN guard in outlier detection)
+the tier-1 sweep was re-run end-to-end on M1 Max 64GB. 7 models × 5
+configs, 0 errors, 39 min wall time. Numbers match v0.7.0 within
+run-to-run noise — confirming the patches fix correctness without
+regressing performance. Raw JSON in [results/post_patch/](results/post_patch/).
+
+| Model | baseline | K4/V4 | K4/V2 | K4/V2+sink | K3/V2 |
+|---|---|---|---|---|---|
+| Qwen3-8B | 1.000 | 0.996 | 0.883 | **0.981** | 0.731 |
+| Qwen3.5-9B (hybrid) | 1.000 | 0.865 | 0.762 | 0.790 | 0.691 |
+| DeepSeek-R1-Qwen3-8B | 1.000 | 0.994 | 0.989 | 0.991 | 0.975 |
+| Llama-3.1-8B | 1.000 | 0.999 | 0.995 | 0.997 | 0.880 |
+| Mistral-7B | 1.000 | 0.999 | 0.994 | 0.998 | 0.988 |
+| Qwen2.5-7B | 1.000 | 0.960 | 0.796 | **0.947** | 0.635 |
+| Phi-3.5-mini | 1.000 | 0.999 | 0.941 | **0.997** | 0.992 |
+
+Decode throughput @ 256/2048 prefill, KV memory @ 4096 ctx, K4/V2+sink128:
+
+| Model | tok/s @ 256 | tok/s @ 2048 | TTFT @ 2k (ms) | KV @ 4k (MB) |
+|---|---|---|---|---|
+| Qwen3-8B | 44.7 | 33.0 | 6597 | 192.6 |
+| DeepSeek-R1-Qwen3-8B | 42.4 | 32.0 | 6620 | 192.6 |
+| Llama-3.1-8B | 57.4 | 35.2 | 6550 | 161.5 |
+| Mistral-7B | 58.5 | 36.0 | 6608 | 161.5 |
+| Qwen2.5-7B | 57.6 | 38.7 | 7288 | 108.6 |
+| Phi-3.5-mini | 78.9 | 29.9 | 3864 | 492.0 |
+
+Two findings worth flagging:
+
+- **Sink128 keeps paying its rent.** On the three models where K4/V2
+  cosine sim was below 0.95 without the sink (Qwen3-8B, Qwen2.5-7B,
+  Phi-3.5), sink128 recovers it to ≥0.95 — and the short-context decode
+  stays close to baseline (Llama 60.6 → 57.4 tok/s, Mistral 61.0 → 58.5).
+- **Qwen3.5-9B remains the outlier.** Hybrid linear+self attention only
+  installs TurboQuant on 8/32 layers, and quality plateaus at 0.87 even
+  at K4/V4. This is a known architectural limit, not a regression — see
+  Limitations §3.
+
 ### Needle-in-a-Haystack
 
 Retrieval of a hidden fact across 1K-8K context, needle at 10%, 50%, and 90% depth (12 tests per config):
@@ -240,6 +281,7 @@ python benchmarks/run_full_suite.py --config benchmarks/models.yaml --tier 2
 | **v0.7.0** | Fused QK scores Metal kernel (4/3/2-bit) + `pre_rotate_query` utility | **2.12× speedup** on long-context decode (T_kv=4096 D=128) vs dequant+matmul. See [BENCHMARKS_v07.md](BENCHMARKS_v07.md). |
 | v0.8.0 *(branch)* | Decomposed SDPA integration — fused QK + separate softmax + V matmul | Correct (cos_sim=1.0) but **0.61x-0.99x** vs `mx.fast.sdpa`. [Post-mortem](docs/FUSED_SDPA_RESULTS.md). Branch: `feat/fused-sdpa-qwen3` |
 | v0.9.0 *(branch)* | Full single-dispatch fused attention kernel (online softmax + packed K/V) | Correct (5/5 tests) but **0.64x-0.86x** vs `mx.fast.sdpa`. [Analysis](docs/FULL_FUSED_ATTENTION_RESULTS.md). Branch: `feat/full-fused-attention` |
+| **v0.8.1** | Bug-fix pass on `main`: `nbytes` undercount on fractional configs, aliased in-place buffer shift in `_drain_chunk`, sticky Metal-kernel fallback, NaN guard in `detect_outlier_layers` | Tier-1 sweep re-run (7 models × 5 configs, 39 min, 0 errors) confirms no regression. See [results/post_patch/](results/post_patch/). |
 
 ## Next Steps
 

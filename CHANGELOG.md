@@ -2,6 +2,48 @@
 
 All notable changes to mlx-turboquant.
 
+## [0.8.1] — 2026-04-08
+
+> Note: v0.8.0 and v0.9.0 refer to in-progress fused-attention attempts
+> that live on `feat/fused-sdpa-qwen3` and `feat/full-fused-attention`
+> branches as documented negative results. v0.8.1 is the first release
+> on `main` after the v0.7.0 fused-QK kernel landing — a bug-fix pass.
+
+
+### Fixed
+
+- **`TurboQuantKVCache.nbytes` undercounted fractional-bit configs.** The
+  low-half packed arrays (`_compressed_keys_lo`, `_compressed_values_lo`)
+  used by 3.5-bit quantization were excluded from the memory total. Memory
+  benchmarks for fractional configs were silently ~12% low.
+  (`mlx_turboquant/cache.py`)
+- **Aliased in-place buffer shift in `_drain_chunk`.** The shift
+  `self.keys[:, :, :remaining, :] = self.keys[:, :, n_compress:, :]`
+  reads from and writes into overlapping ranges of the same buffer.
+  MLX's lazy graph does not guarantee a copy on aliased writes, so the
+  result was undefined whenever `remaining > 0` (the common decode case).
+  Fixed by materializing the RHS into a fresh allocation via
+  `mx.async_eval` before the assignment.
+  (`mlx_turboquant/cache.py`)
+- **Metal dequantize fallback was non-sticky and silent.** A failure in
+  the fused Metal kernel was caught with a bare `except: pass` and
+  retried on every subsequent decode step, paying the failure overhead
+  per token with no diagnostic. Failures are now sticky per cache instance
+  and emit a `RuntimeWarning` once with the underlying exception.
+  (`mlx_turboquant/cache.py`)
+- **`detect_outlier_layers` returned NaN-poisoned thresholds when no key
+  norms were positive.** `np.median([])` returns NaN, making
+  `n > threshold * nan` always False, so the function silently classified
+  every layer as non-outlier. Now returns `[]` explicitly in that
+  degenerate case. (`mlx_turboquant/patch.py`)
+
+### Validated
+
+- Tier-1 benchmark sweep re-run on M1 Max 64GB after patches: 7 models ×
+  5 configs (35 cells), zero errors, 39 min wall time. Quality, decode
+  speed, TTFT, and KV memory all within run-to-run noise of the v0.7.0
+  numbers — confirming no regression. Raw data in `results/post_patch/`.
+
 ## [0.7.0] — 2026-04-07
 
 ### Added
