@@ -45,6 +45,11 @@ jobs:
           python --version
           python -c "import mlx_turboquant; print('mlx-turboquant', mlx_turboquant.__version__)"
 
+      - name: Smoke tests (fail fast — public API contract)
+        run: python -m pytest tests/test_smoke.py -v
+
+      - name: CLI entry point smoke
+        run: mlx-turboquant --help
+
       - name: Run unit tests
-        run: |
-          python -m pytest tests/ -q --ignore=tests/test_integration.py
+        run: python -m pytest tests/ -q --ignore=tests/test_integration.py

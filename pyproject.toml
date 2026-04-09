@@ -12,17 +12,30 @@ requires-python = ">=3.10"
 authors = [
     {name = "Alexis Castellanos"},
 ]
-keywords = ["mlx", "quantization", "kv-cache", "llm", "apple-silicon"]
+keywords = [
+    "mlx",
+    "quantization",
+    "kv-cache",
+    "llm",
+    "apple-silicon",
+    "metal",
+    "inference",
+    "long-context",
+    "turboquant",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Operating System :: MacOS",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "mlx>=0.20.0",
@@ -40,6 +53,9 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/alex-rentel/mlx-turboquant"
 Repository = "https://github.com/alex-rentel/mlx-turboquant"
+Changelog = "https://github.com/alex-rentel/mlx-turboquant/blob/main/CHANGELOG.md"
+Issues = "https://github.com/alex-rentel/mlx-turboquant/issues"
+Documentation = "https://github.com/alex-rentel/mlx-turboquant/blob/main/README.md"
 
 [project.scripts]
 mlx-turboquant = "mlx_turboquant.cli:main"
@@ -48,7 +64,7 @@ mlx-turboquant = "mlx_turboquant.cli:main"
 include = ["mlx_turboquant*"]
 
 [tool.setuptools.package-data]
-mlx_turboquant = ["codebooks/*.npz"]
+mlx_turboquant = ["codebooks/*.npz", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
