@@ -2,6 +2,58 @@
 
 All notable changes to mlx-turboquant.
 
+## [1.0.1] — 2026-04-29
+
+Patch release. Post-v1.0.0 review polish — bug fixes and tooling. No
+algorithmic changes; runtime behavior is identical for the documented
+use cases that already worked.
+
+### Fixed
+
+- **`apply_turboquant` type annotations.** `key_bits` and `value_bits`
+  were typed `int` but the README documents `3.5` as a valid fractional
+  value and the underlying cache accepted it at runtime. Type-checkers
+  rejected documented usage. Both parameters now typed `float`.
+- **MLX dependency floor.** `pyproject.toml` had `mlx>=0.20.0` while
+  the README and the `mx.fast.metal_kernel` API usage in `kernels.py`
+  require `>=0.31`. Bumped to match.
+- **Codebook persistence path.** `get_codebook()` previously wrote
+  newly-computed `.npz` files into the package source directory. That
+  path is read-only when pip-installed into site-packages, causing
+  `PermissionError` for any non-precomputed `(head_dim, bits)` combo.
+  Runtime writes now go to `~/.cache/mlx_turboquant/` (overridable via
+  `$XDG_CACHE_HOME` or `$MLX_TURBOQUANT_CACHE`); shipped codebooks are
+  still loaded from the package dir.
+- **`TurboQuantKVCache.make_mask` silent contract hole.** The method
+  accepted a `window_size` argument but ignored it, silently returning
+  full-causal masking for sliding-window callers. Now raises
+  `NotImplementedError` so the missing capability is loud.
+- **`apply_turboquant` upgrade-bits warning.** Warning text now reports
+  the *effective* config after the auto-upgrade for low-`nkv` models,
+  not just the delta.
+
+### Tooling
+
+- **ruff + pyright in CI.** The package shipped `py.typed` from v1.0.0
+  but had no type checker enforcing the typed contract — exactly why
+  the `int`/`float` annotation bug shipped. CI now runs both on every
+  push. Pyright is configured at `basic` mode with Optional-narrowing
+  rules suppressed (cache.py uses runtime length-guards that pyright
+  cannot see); `reportArgumentType` stays at `error` to catch the next
+  int-vs-float-style bug.
+- **Type-narrowing asserts in `cache.py`.** Five `assert ... is not
+  None` invariant checks added at sites where pyright could not narrow
+  Optional fields tied together by runtime sequencing.
+
+### Repo housekeeping
+
+- `BENCHMARKS_v07.md` renamed to `docs/BENCHMARKS_FUSED_QK.md` for
+  clarity (it covers the v0.7.0 fused QK micro-benchmark, not
+  end-to-end model results — distinct from `BENCHMARKS.md`). All
+  references updated.
+- 185 tests passing (was 183 in v1.0.0 — added two contract tests for
+  the codebook cache redirect and the `make_mask` window_size guard).
+
 ## [1.0.0] — 2026-04-08
 
 First stable release. No algorithmic changes — this release draws a
