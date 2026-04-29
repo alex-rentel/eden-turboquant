@@ -52,6 +52,7 @@ dev = [
     "scipy>=1.10.0",
     "ruff>=0.5",
     "pyright>=1.1.350",
+    "psutil>=5.9",  # required by benchmarks/run_full_suite.py for memory profiling
 ]
 
 [project.urls]
