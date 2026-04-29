@@ -10,28 +10,41 @@ Tests cover:
 """
 
 import math
-import numpy as np
+
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_turboquant.codebook import (
-    lloyd_max, get_codebook, quantize_scalar, dequantize_scalar,
-    compute_theoretical_mse, beta_pdf, gaussian_pdf,
-)
-from mlx_turboquant.rotation import (
-    get_rotation_matrix, rotate, inverse_rotate, hadamard_matrix,
-    randomized_hadamard,
+    compute_theoretical_mse,
+    dequantize_scalar,
+    get_codebook,
+    lloyd_max,
+    quantize_scalar,
 )
 from mlx_turboquant.packing import (
-    pack_2bit, unpack_2bit, pack_3bit, unpack_3bit,
-    pack_4bit, unpack_4bit, pack_indices, unpack_indices,
+    pack_2bit,
+    pack_3bit,
+    pack_4bit,
+    pack_indices,
+    unpack_2bit,
+    unpack_3bit,
+    unpack_4bit,
+    unpack_indices,
+)
+from mlx_turboquant.qjl import (
+    generate_projection_matrix,
+    qjl_dequantize,
+    qjl_quantize,
 )
 from mlx_turboquant.quantizer import TurboQuantMSE, TurboQuantProd
-from mlx_turboquant.qjl import (
-    generate_projection_matrix, qjl_quantize, qjl_dequantize,
-    qjl_inner_product,
+from mlx_turboquant.rotation import (
+    get_rotation_matrix,
+    hadamard_matrix,
+    inverse_rotate,
+    randomized_hadamard,
+    rotate,
 )
-
 
 # ============================================================
 # Codebook Tests
@@ -80,7 +93,7 @@ class TestLloydMax:
         # Paper claims within ~2.7x, we allow 3.0x for numerical tolerance
         ratio = total_mse / lower_bound
         assert ratio < 3.0, f"MSE ratio {ratio:.2f} exceeds 3.0x of Shannon bound"
-        assert total_mse > lower_bound * 0.5, f"MSE suspiciously below lower bound"
+        assert total_mse > lower_bound * 0.5, "MSE suspiciously below lower bound"
 
     def test_get_codebook_returns_mlx(self):
         centroids, boundaries = get_codebook(128, 4)

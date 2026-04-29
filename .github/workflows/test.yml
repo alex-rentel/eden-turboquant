@@ -47,7 +47,7 @@ jobs:
           python -c "import mlx_turboquant; print('mlx-turboquant', mlx_turboquant.__version__)"
 
       - name: Lint (ruff)
-        run: ruff check mlx_turboquant/
+        run: ruff check mlx_turboquant/ tests/
 
       - name: Type-check (pyright)
         run: pyright

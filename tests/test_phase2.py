@@ -9,14 +9,12 @@ Tests cover:
 - Integration with actual mlx-lm model (if available)
 """
 
-import math
-import numpy as np
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_turboquant.cache import TurboQuantKVCache
-from mlx_turboquant.patch import apply_turboquant, enable_turboquant, _get_model_config
-
+from mlx_turboquant.patch import _get_model_config, apply_turboquant, enable_turboquant
 
 # ============================================================
 # Cache Unit Tests (no model needed)

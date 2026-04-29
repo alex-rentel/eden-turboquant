@@ -9,6 +9,7 @@ def test_cache_interface_with_real_model():
     try:
         import mlx.core as mx
         from mlx_lm import load
+
         from mlx_turboquant import apply_turboquant
     except ImportError:
         pytest.skip("mlx-lm not installed")

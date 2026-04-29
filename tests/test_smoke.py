@@ -68,9 +68,9 @@ def test_fused_kernel_primitives_importable():
     """Research-only but must stay importable — downstream users may
     experiment with them directly."""
     from mlx_turboquant.kernels import (
-        fused_qk_scores_4bit,
-        fused_qk_scores_3bit,
         fused_qk_scores_2bit,
+        fused_qk_scores_3bit,
+        fused_qk_scores_4bit,
     )
     assert callable(fused_qk_scores_4bit)
     assert callable(fused_qk_scores_3bit)

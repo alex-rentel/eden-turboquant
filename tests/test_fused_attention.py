@@ -9,19 +9,17 @@ must match ``Q @ dequantize(packed_K, norms, centroids, R).T`` to
 within ``atol=1e-4``.
 """
 
-import numpy as np
 import mlx.core as mx
-import pytest
+import numpy as np
 
-from mlx_turboquant.rotation import (
-    get_rotation_matrix,
-    rotate,
-    inverse_rotate,
-    pre_rotate_query,
-)
 from mlx_turboquant.codebook import get_codebook, quantize_scalar
 from mlx_turboquant.packing import pack_indices
-
+from mlx_turboquant.rotation import (
+    get_rotation_matrix,
+    inverse_rotate,
+    pre_rotate_query,
+    rotate,
+)
 
 # Resolve MLX graph materialization via getattr to sidestep a lint hook.
 # This is mlx.core's array realization primitive, not Python's builtin.

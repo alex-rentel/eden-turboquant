@@ -3,16 +3,15 @@
 Tests for error handling, boundary conditions, and unusual inputs.
 """
 
-import math
-import numpy as np
 import mlx.core as mx
+import numpy as np
 import pytest
 
-from mlx_turboquant.codebook import get_codebook, lloyd_max, quantize_scalar, dequantize_scalar
-from mlx_turboquant.rotation import get_rotation_matrix, hadamard_matrix, randomized_hadamard
+from mlx_turboquant.cache import TurboQuantKVCache
+from mlx_turboquant.codebook import dequantize_scalar, get_codebook, lloyd_max, quantize_scalar
 from mlx_turboquant.packing import pack_indices, unpack_indices
 from mlx_turboquant.quantizer import TurboQuantMSE, TurboQuantProd
-from mlx_turboquant.cache import TurboQuantKVCache
+from mlx_turboquant.rotation import get_rotation_matrix, hadamard_matrix
 
 
 class TestCodebookEdgeCases:
@@ -258,10 +257,11 @@ class TestCacheEdgeCases:
         keys = mx.array(np.random.randn(1, 2, 10, 128).astype(np.float32))
         values = mx.array(np.random.randn(1, 2, 10, 128).astype(np.float32))
         cache.update_and_fetch(keys, values)
-        state = cache.state
         meta = cache.meta_state
         assert meta["offset"] == "10"
         assert meta["head_dim"] == "128"
+        # state property is also exercised — must not raise.
+        assert cache.state is not None
 
     def test_is_not_trimmable(self):
         cache = TurboQuantKVCache(head_dim=128)
@@ -329,9 +329,10 @@ class TestPatchEdgeCases:
         """Manual skip_layers should work."""
         try:
             from mlx_lm import load
-            from mlx_turboquant.patch import apply_turboquant
-            from mlx_turboquant.cache import TurboQuantKVCache
             from mlx_lm.models.cache import KVCache
+
+            from mlx_turboquant.cache import TurboQuantKVCache
+            from mlx_turboquant.patch import apply_turboquant
 
             model, _ = load("mlx-community/Qwen2.5-7B-Instruct-4bit")
             apply_turboquant(model, skip_layers=[0, 27], auto_detect_outliers=False)
@@ -347,8 +348,9 @@ class TestPatchEdgeCases:
         """Should work with auto_detect_outliers=False."""
         try:
             from mlx_lm import load
-            from mlx_turboquant.patch import apply_turboquant
+
             from mlx_turboquant.cache import TurboQuantKVCache
+            from mlx_turboquant.patch import apply_turboquant
 
             model, _ = load("mlx-community/Qwen2.5-7B-Instruct-4bit")
             apply_turboquant(model, auto_detect_outliers=False)
@@ -363,8 +365,8 @@ class TestPatchEdgeCases:
         Uses a synthetic mock model with mixed self_attn and linear_attn
         layers so the test runs without needing the real ~5GB model file.
         """
-        from mlx_turboquant.patch import apply_turboquant
         from mlx_turboquant.cache import TurboQuantKVCache
+        from mlx_turboquant.patch import apply_turboquant
 
         # Build a fake model with 4 layers: [self, linear, self, linear]
         class FakeArgs:
@@ -401,7 +403,6 @@ class TestPatchEdgeCases:
 
         # Patch make_prompt_cache to return placeholder caches we can identify
         import mlx_lm.models.cache as mlx_cache_mod
-        sentinel = object()
 
         class SentinelCache:
             def __init__(self, idx):
@@ -439,6 +440,7 @@ class TestPatchEdgeCases:
         KVCache and RotatingKVCache so the test runs without a real model.
         """
         from mlx_lm.models.cache import KVCache, RotatingKVCache
+
         from mlx_turboquant.cache import TurboQuantKVCache
         from mlx_turboquant.patch import apply_turboquant
 
