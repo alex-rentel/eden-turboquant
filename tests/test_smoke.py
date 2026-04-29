@@ -16,8 +16,17 @@ in CI output.
 """
 
 import argparse
+import importlib
+import sys
+from pathlib import Path
 
 import pytest
+
+# Make `benchmarks/` importable for the benchmark-script smoke test below.
+# The benchmarks/ folder lives at repo root; add it to sys.path once.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def test_package_imports():
@@ -131,3 +140,36 @@ class TestCliValidators:
         for bad in ("", "abc", "128,abc", "128,-1", "128,0", "128,3.14"):
             with pytest.raises(argparse.ArgumentTypeError):
                 _csv_positive_ints(bad)
+
+
+# ---------------------------------------------------------------------------
+# benchmarks/ scripts
+# ---------------------------------------------------------------------------
+#
+# The benchmarks/ folder is run manually, not in CI. Adding an import-only
+# smoke test here means an import-path drift (renamed module, removed
+# helper, broken __init__.py) gets caught the next time CI runs, instead
+# of waiting until someone runs the script by hand and notices.
+
+_BENCHMARK_MODULES = [
+    "benchmarks.bench_memory",
+    "benchmarks.bench_quality",
+    "benchmarks.bench_speed",
+    "benchmarks.micro_fused_qk",
+    "benchmarks.needle_haystack",
+    "benchmarks.needle_long_context",
+    "benchmarks.report_builder",
+    "benchmarks.run_full_suite",
+    "benchmarks.verify_models",
+]
+
+
+@pytest.mark.parametrize("module_name", _BENCHMARK_MODULES)
+def test_benchmark_script_imports(module_name):
+    """Every benchmark script must import without error.
+
+    These scripts aren't otherwise exercised by CI — silent import
+    breakage from a refactor in mlx_turboquant/ would not surface
+    until someone tried to run the bench by hand. This catches it.
+    """
+    importlib.import_module(module_name)
