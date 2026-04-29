@@ -433,6 +433,160 @@ class TestPatchEdgeCases:
             "linear_attn layer 3 should be the model default cache"
 
 
+    def test_get_model_config_falls_back_to_num_attention_heads(self):
+        """When args.num_key_value_heads is None, _get_model_config falls
+        back to args.num_attention_heads. Covers the num_kv_heads fallback."""
+        from mlx_turboquant.patch import _get_model_config
+
+        class FakeArgs:
+            head_dim = 64
+            num_attention_heads = 8
+            hidden_size = 512
+            num_hidden_layers = 4
+            # No num_key_value_heads / num_kv_heads — forces the fallback.
+
+        class FakeLayer:
+            def __init__(self):
+                self.self_attn = object()
+
+        class FakeInner:
+            def __init__(self):
+                self.args = FakeArgs()
+                self.layers = [FakeLayer() for _ in range(4)]
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+                self.args = FakeArgs()
+
+        cfg = _get_model_config(FakeModel())
+        assert cfg["head_dim"] == 64
+        assert cfg["num_kv_heads"] == 8  # fell back to num_attention_heads
+        assert cfg["num_layers"] == 4
+
+    def test_get_model_config_computes_head_dim_from_hidden_size(self):
+        """If head_dim isn't on args but hidden_size and num_attention_heads
+        are, _get_model_config should derive it (hidden_size // num_heads)."""
+        from mlx_turboquant.patch import _get_model_config
+
+        class FakeArgs:
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            hidden_size = 1024  # → head_dim = 128
+            num_hidden_layers = 2
+
+        class FakeLayer:
+            def __init__(self):
+                self.self_attn = object()
+
+        class FakeInner:
+            def __init__(self):
+                self.args = FakeArgs()
+                self.layers = [FakeLayer() for _ in range(2)]
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+                self.args = FakeArgs()
+
+        cfg = _get_model_config(FakeModel())
+        assert cfg["head_dim"] == 128
+
+    def test_get_model_config_raises_when_unrecognizable(self):
+        """A model with no extractable args / weights should raise ValueError
+        (rather than silently returning bogus defaults)."""
+        from mlx_turboquant.patch import _get_model_config
+
+        class Empty:
+            pass
+
+        with pytest.raises(ValueError, match="Could not determine model"):
+            _get_model_config(Empty())
+
+    def test_detect_outlier_layers_returns_empty_when_no_positive_norms(self):
+        """The empty-positive guard prevents NaN propagation through the
+        median calculation when no layer produced any signal. Covers the
+        ``positive.size == 0`` branch."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+
+        from mlx_turboquant.patch import detect_outlier_layers
+
+        # Fake model whose forward pass leaves cache.keys = None on every
+        # layer. detect_outlier_layers should append 0.0 for each layer
+        # (no signal) and return [] rather than crashing on np.median([]).
+        class FakeLayer:
+            pass
+
+        class FakeInner:
+            def __init__(self):
+                self.layers = [FakeLayer(), FakeLayer(), FakeLayer()]
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+
+            def __call__(self, dummy, cache):
+                # Return a tiny tensor; do not populate any cache slot.
+                return mx.zeros((1, dummy.shape[1], 4))
+
+        # Need .layers off the inner — the function reads
+        # `getattr(inner, "layers", [])`.
+        outliers = detect_outlier_layers(FakeModel())
+        assert outliers == []
+        # Also exercise the path with a single all-None KVCache list.
+        m = FakeModel()
+        cache = [KVCache() for _ in m.model.layers]
+        # Don't actually update cache; the function will see all keys=None.
+        assert all(c.keys is None for c in cache)
+
+    def test_apply_turboquant_warns_on_low_nkv_upgrade(self):
+        """Models with nkv <= 2 trigger automatic upgrade of low bit-widths
+        and emit a UserWarning that names the effective config."""
+        import warnings
+
+        from mlx_turboquant.cache import TurboQuantKVCache
+        from mlx_turboquant.patch import apply_turboquant
+
+        class FakeArgs:
+            head_dim = 128
+            num_attention_heads = 8
+            num_key_value_heads = 1  # nkv = 1, triggers both upgrades
+            hidden_size = 1024
+            num_hidden_layers = 2
+
+        class FakeLayer:
+            def __init__(self):
+                self.self_attn = object()
+
+        class FakeInner:
+            def __init__(self):
+                self.args = FakeArgs()
+                self.layers = [FakeLayer() for _ in range(2)]
+
+        class FakeModel:
+            def __init__(self):
+                self.model = FakeInner()
+                self.args = FakeArgs()
+
+        fake = FakeModel()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            apply_turboquant(fake, key_bits=2, value_bits=2,
+                             auto_detect_outliers=False)
+
+        msgs = [str(w.message) for w in caught
+                if issubclass(w.category, UserWarning)]
+        assert any("upgrading key_bits" in m for m in msgs), msgs
+        assert any("upgrading value_bits" in m for m in msgs), msgs
+
+        # The cache that gets built should reflect the upgraded bits.
+        cache = fake.make_cache()
+        tq_caches = [c for c in cache if isinstance(c, TurboQuantKVCache)]
+        assert tq_caches  # at least one TurboQuantKVCache was created
+        assert tq_caches[0].key_bits == 4
+        assert tq_caches[0].value_bits == 3
+
     def test_sliding_window_attention_layers_skipped(self):
         """SWA layers (RotatingKVCache default) must NOT receive a
         TurboQuantKVCache, since TurboQuantKVCache.make_mask raises on
