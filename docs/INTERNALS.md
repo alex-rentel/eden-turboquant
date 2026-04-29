@@ -9,18 +9,27 @@ notes. For user-facing install/usage docs, see [README.md](../README.md).
 
 ## Fused Metal kernels — what's on the supported path
 
-The supported decode path uses two fused Metal kernels, both wired into
-`TurboQuantKVCache`:
+Only one fused Metal kernel sits on the supported decode path:
 
-- **`metal_dequantize`** — single dispatch: unpack indices → centroid lookup
-  → inverse rotation → norm scaling. Replaces the per-token Python path.
-- **`metal_quantize_4bit`** — single dispatch for the quantize side. Used
-  when tokens roll out of the FP16 residual window into compressed storage.
+- **`metal_dequantize`** — single dispatch: unpack indices → centroid
+  lookup → inverse rotation → norm scaling. Wired into
+  `TurboQuantKVCache._dequantize_kv`. Replaces the per-token Python path
+  and is gated behind a sticky `_metal_dequant_disabled` fallback to a
+  pure-MLX path if the kernel ever raises.
 
-These brought the decode overhead from 57% (pure Python, v0.2.0) down to
-11% (batch compression + pre-allocated FP16 window, v0.5.0) to where it is
-today. At short contexts (~256 tokens) the quantized path is within 2-5%
-of the FP16 baseline on most models.
+`metal_quantize_4bit` exists in `mlx_turboquant.kernels` and is
+correctness-tested, but **is not currently wired into the compress hot
+path**. The cache's `_quantize_kv` runs the pure-MLX
+`rotate` + `quantize_scalar` + `pack_indices` pipeline instead.
+A v1.0.2 microbench (in the `kernels.py` module docstring) showed MLX's
+MPS-backed matmul wins for any realistic decode-batch size — the kernel
+only beats it for `N <= 512`. The kernel stays as a tested foundation
+for future research that closes the gap (e.g. simd_sum reduction).
+
+These integration choices brought decode overhead from 57% (pure Python,
+v0.2.0) to 11% (batch compression + pre-allocated FP16 window, v0.5.0).
+At short contexts (~256 tokens) the quantized path is within 2–5% of the
+FP16 baseline on most models.
 
 ## Fused QK scores kernels — research-only primitives
 
@@ -119,6 +128,8 @@ end-to-end integration test.
 | v0.9.0 *(branch)* | Full single-dispatch fused attention kernel | Correct but 0.64×–0.86× vs `mx.fast.sdpa`. Branch only. |
 | v0.8.1 | Bug-fix pass on main: `nbytes` undercount on fractional configs, aliased in-place buffer shift in `_drain_chunk`, sticky Metal-kernel fallback, NaN guard in `detect_outlier_layers` | Tier-1 sweep re-run (7 models × 5 configs, 0 errors) confirmed no regression. |
 | **v1.0.0** | Public API freeze, user-facing README rewrite, CI, v1.0.0 PyPI release | Stable library surface. Fused QK kernel officially demoted to research primitive. |
+| v1.0.1 | Post-v1.0 review polish: fixed `apply_turboquant` bit-type annotations, raised mlx floor to 0.31, codebook cache → user dir, `make_mask` now raises on `window_size`, ruff + pyright in CI | 183 → 185 passing |
+| **v1.0.2** | SWA layer auto-skip in `apply_turboquant`, `precompute_codebooks` user-cache fix, `_drain_chunk` aliasing workaround dropped under MLX 0.31, `_quant_4bit_pack_kernel` rewritten with shared memory (still unwired — MLX wins for realistic batches), Python 3.13 in CI, parameterized state.setter round-trip tests, fused-SDPA tripwire | 185 → 207 passing |
 
 ## Community implementations
 
