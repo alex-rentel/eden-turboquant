@@ -136,8 +136,8 @@ def detect_outlier_layers(model: nn.Module, threshold: float = 3.0) -> list[int]
 
 def apply_turboquant(
     model: nn.Module,
-    key_bits: int = 4,
-    value_bits: int = 2,
+    key_bits: float = 4,
+    value_bits: float = 2,
     residual_window: int = 128,
     head_dim: Optional[int] = None,
     num_kv_heads: Optional[int] = None,
@@ -157,8 +157,10 @@ def apply_turboquant(
 
     Args:
         model: An mlx-lm model (Llama, Qwen, Mistral, Gemma, etc.)
-        key_bits: Bit-width for key quantization (2, 3, or 4)
-        value_bits: Bit-width for value quantization (2, 3, or 4)
+        key_bits: Bit-width for key quantization (2, 3, 3.5, or 4).
+            Fractional values quantize the high half of the rotated head
+            at the integer ceiling and the low half at the floor.
+        value_bits: Bit-width for value quantization (2, 3, 3.5, or 4).
         residual_window: Number of recent tokens to keep in FP16 (sliding)
         head_dim: Override head dimension (auto-detected if None)
         num_kv_heads: Override number of KV heads (auto-detected if None)
