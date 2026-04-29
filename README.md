@@ -29,8 +29,12 @@ cd mlx-turboquant
 pip install -e .
 ```
 
-Requires Python 3.10+, macOS 13+, Apple Silicon (M1/M2/M3/M4), and
-`mlx >= 0.31`.
+Requires Python 3.10+ (tested on 3.10–3.13), macOS 13+, Apple Silicon
+(M1/M2/M3/M4), and `mlx >= 0.31`.
+
+> Last validated 2026-04-29 against MLX 0.31.1 on M1 Max — full suite
+> green at 205 unit tests, real-model integration test green on
+> Qwen3-0.6B-4bit.
 
 ## Quick start
 
