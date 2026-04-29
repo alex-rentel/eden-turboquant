@@ -14,7 +14,12 @@ def run_generate(args):
     from .patch import apply_turboquant
 
     print(f"Loading model: {args.model}")
-    model, tokenizer = load(args.model)
+    # mlx-lm's load() returns either (model, tokenizer) or
+    # (model, tokenizer, config) depending on version; index the first
+    # two slots explicitly so the type checker sees a clean assignment.
+    loaded = load(args.model)
+    model = loaded[0]
+    tokenizer = loaded[1]
 
     print(f"Applying TurboQuant: K{args.key_bits}/V{args.value_bits}, "
           f"residual_window={args.residual_window}")
