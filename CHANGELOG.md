@@ -2,6 +2,52 @@
 
 All notable changes to mlx-turboquant.
 
+## [1.0.4] — 2026-04-29
+
+Patch release. Test depth on the model-integration glue, coverage
+gates, automated release workflow, contributor consistency. No
+production runtime changes.
+
+### Added
+
+- **5 mock-based tests for `patch.py`** branches that previously needed
+  a real mlx-lm model to exercise (`pytest.skip`-gated in CI):
+  - `_get_model_config` num_kv_heads fallback to num_attention_heads.
+  - `_get_model_config` head_dim derived from hidden_size.
+  - `_get_model_config` ValueError on unrecognizable models.
+  - `detect_outlier_layers` empty-positive guard (prevents NaN
+    propagation through median).
+  - `apply_turboquant` low-nkv (≤2) automatic bit upgrade — verifies
+    both the warning text and the cache reflects the upgraded bits.
+
+  Result: patch.py 76% → 86% coverage. Total project coverage 93% → 95%.
+
+- **`benchmarks/` import smoke test.** All 9 scripts under
+  `benchmarks/` are run manually, not in CI. A new parameterized
+  test in `tests/test_smoke.py` imports each module so a refactor
+  in `mlx_turboquant/` that breaks an import path can't rot
+  unnoticed.
+
+- **`.github/workflows/release.yml`.** Tag → wheel + sdist + draft
+  GitHub Release is now automated. Fires on push of a `v*.*.*` tag
+  (or manually via `workflow_dispatch`); pulls release notes from
+  the matching CHANGELOG block. PyPI upload stays manual.
+
+- **`.editorconfig`** for cross-editor consistency (4-space py,
+  2-space yaml, LF endings, trim trailing whitespace).
+
+### Changed
+
+- **Coverage gate raised from 85% → 90%.** With the patch.py mock
+  tests the actual coverage is ~95%, so the new floor still has
+  ~5pp headroom but locks in the gain. `--cov-fail-under=90` in
+  CI's coverage step.
+
+### Test counts
+
+- v1.0.3 shipped at 214 passing.
+- v1.0.4: **228 passing** (+14: 9 benchmark imports, 5 patch.py).
+
 ## [1.0.3] — 2026-04-29
 
 Patch release. Tooling, contributor docs, dead-code removal, input
