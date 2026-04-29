@@ -277,6 +277,31 @@ class TestCacheEdgeCases:
         mx.eval(k_out, v_out)
         assert k_out.shape == (1, 2, 20, 256)
 
+    def test_make_mask_rejects_window_size(self):
+        """Sliding-window attention is unsupported and must raise, not silently
+        return full-causal masking."""
+        cache = TurboQuantKVCache(head_dim=128)
+        assert cache.make_mask(N=4) == "causal"
+        assert cache.make_mask(N=1) is None
+        with pytest.raises(NotImplementedError, match="sliding-window"):
+            cache.make_mask(N=4, window_size=128)
+
+
+class TestCodebookCacheLocation:
+    """Codebook persistence should not require write access to the package dir."""
+
+    def test_runtime_codebook_writes_to_user_cache(self, tmp_path, monkeypatch):
+        from mlx_turboquant import codebook as cb
+        monkeypatch.setenv("MLX_TURBOQUANT_CACHE", str(tmp_path))
+        d, bits = 48, 2
+        shipped = cb.CODEBOOK_DIR / f"codebook_d{d}_b{bits}.npz"
+        assert not shipped.exists(), "test assumes (48, 2) is not a shipped codebook"
+        cb._codebook_cache.pop((d, bits), None)
+        c, b = cb.get_codebook(d, bits)
+        assert c.shape == (4,)
+        assert (tmp_path / "mlx_turboquant" / f"codebook_d{d}_b{bits}.npz").exists()
+        assert not shipped.exists()
+
 
 class TestPatchEdgeCases:
     """Edge cases for model patching."""

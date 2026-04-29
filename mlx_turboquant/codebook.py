@@ -16,6 +16,19 @@ import numpy as np
 
 CODEBOOK_DIR = Path(__file__).parent / "codebooks"
 
+
+def _user_cache_dir() -> Path:
+    """User-writable cache directory for codebooks computed at runtime.
+
+    Honors XDG_CACHE_HOME; falls back to ~/.cache. The package-shipped
+    codebooks under CODEBOOK_DIR are still preferred when present.
+    """
+    base = os.environ.get("XDG_CACHE_HOME") or os.environ.get("MLX_TURBOQUANT_CACHE")
+    if base:
+        return Path(base) / "mlx_turboquant"
+    return Path.home() / ".cache" / "mlx_turboquant"
+
+
 # Cache computed codebooks in memory
 _codebook_cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
@@ -138,17 +151,25 @@ def get_codebook(d: int, bits: int) -> tuple[mx.array, mx.array]:
     """
     key = (d, bits)
     if key not in _codebook_cache:
-        # Try loading from disk
-        npz_path = CODEBOOK_DIR / f"codebook_d{d}_b{bits}.npz"
-        if npz_path.exists():
-            data = np.load(npz_path)
+        filename = f"codebook_d{d}_b{bits}.npz"
+        shipped_path = CODEBOOK_DIR / filename
+        user_path = _user_cache_dir() / filename
+
+        if shipped_path.exists():
+            data = np.load(shipped_path)
+            _codebook_cache[key] = (data["centroids"], data["boundaries"])
+        elif user_path.exists():
+            data = np.load(user_path)
             _codebook_cache[key] = (data["centroids"], data["boundaries"])
         else:
             centroids, boundaries = lloyd_max(d, bits)
             _codebook_cache[key] = (centroids, boundaries)
-            # Save for future use
-            CODEBOOK_DIR.mkdir(parents=True, exist_ok=True)
-            np.savez(npz_path, centroids=centroids, boundaries=boundaries)
+            # Persist to user-writable cache; package dir may be read-only when pip-installed.
+            try:
+                user_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez(user_path, centroids=centroids, boundaries=boundaries)
+            except OSError:
+                pass
 
     centroids, boundaries = _codebook_cache[key]
     return mx.array(centroids, dtype=mx.float32), mx.array(boundaries, dtype=mx.float32)

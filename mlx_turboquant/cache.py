@@ -689,8 +689,18 @@ class TurboQuantKVCache:
 
     def make_mask(self, N: int, offset: int = 0, return_array: bool = False,
                   window_size: Optional[int] = None) -> Optional[Any]:
-        """Generate attention mask. Returns 'causal' for standard causal masking."""
-        T = self.offset
+        """Generate attention mask. Returns 'causal' for standard causal masking.
+
+        Sliding-window attention is not implemented for TurboQuantKVCache —
+        passing a non-None window_size raises rather than silently returning
+        full-causal masking.
+        """
+        if window_size is not None:
+            raise NotImplementedError(
+                "TurboQuantKVCache does not support sliding-window attention "
+                f"(window_size={window_size}). Use the model's default cache "
+                "for sliding-window layers."
+            )
         if N == 1 and not return_array:
             return None
         return "causal"
