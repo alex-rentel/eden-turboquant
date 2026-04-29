@@ -539,17 +539,15 @@ class TurboQuantKVCache:
         """
         old_keys = self.keys[:, :, :n_compress, :]
         old_values = self.values[:, :, :n_compress, :]
-        # Shift remaining to front of pre-allocated buffer.
-        # The LHS and RHS slices alias the same underlying buffer; force
-        # the RHS to materialize into a separate allocation before the
-        # in-place write so MLX's lazy graph cannot interleave them.
+        # Shift remaining tokens to the front of the pre-allocated buffer.
+        # In older MLX versions the LHS / RHS slices aliased the same
+        # underlying buffer and required a defensive mx.array(...) wrap
+        # to force materialization first; under MLX 0.31+ the lazy graph
+        # respects the in-place assignment ordering.
         remaining = self._fp16_len - n_compress
         if remaining > 0:
-            shifted_k = mx.array(self.keys[:, :, n_compress:self._fp16_len, :])
-            shifted_v = mx.array(self.values[:, :, n_compress:self._fp16_len, :])
-            mx.async_eval(shifted_k, shifted_v)
-            self.keys[:, :, :remaining, :] = shifted_k
-            self.values[:, :, :remaining, :] = shifted_v
+            self.keys[:, :, :remaining, :] = self.keys[:, :, n_compress:self._fp16_len, :]
+            self.values[:, :, :remaining, :] = self.values[:, :, n_compress:self._fp16_len, :]
         self._fp16_len = remaining
 
         # Compress keys and values for this chunk
