@@ -302,6 +302,25 @@ class TestCodebookCacheLocation:
         assert (tmp_path / "mlx_turboquant" / f"codebook_d{d}_b{bits}.npz").exists()
         assert not shipped.exists()
 
+    def test_precompute_codebooks_default_writes_to_user_cache(self, tmp_path, monkeypatch):
+        """precompute_codebooks must not require write access to the package dir."""
+        from mlx_turboquant import codebook as cb
+        monkeypatch.setenv("MLX_TURBOQUANT_CACHE", str(tmp_path))
+        d, bits = 50, 2
+        shipped = cb.CODEBOOK_DIR / f"codebook_d{d}_b{bits}.npz"
+        assert not shipped.exists(), "test assumes (50, 2) is not a shipped codebook"
+        cb.precompute_codebooks(dims=(d,), bits_range=(bits,))
+        assert (tmp_path / "mlx_turboquant" / f"codebook_d{d}_b{bits}.npz").exists()
+        assert not shipped.exists()
+
+    def test_precompute_codebooks_target_dir_override(self, tmp_path):
+        """target_dir argument routes writes to an explicit location
+        (the maintainer workflow that seeds shipped codebooks)."""
+        from mlx_turboquant import codebook as cb
+        d, bits = 52, 2
+        cb.precompute_codebooks(dims=(d,), bits_range=(bits,), target_dir=tmp_path)
+        assert (tmp_path / f"codebook_d{d}_b{bits}.npz").exists()
+
 
 class TestPatchEdgeCases:
     """Edge cases for model patching."""

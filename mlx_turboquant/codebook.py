@@ -177,12 +177,24 @@ def get_codebook(d: int, bits: int) -> tuple[mx.array, mx.array]:
 def precompute_codebooks(
     dims: tuple[int, ...] = (64, 96, 128, 256),
     bits_range: tuple[int, ...] = (2, 3, 4),
+    target_dir: Path | None = None,
 ) -> None:
-    """Precompute and save codebooks for common configurations."""
-    CODEBOOK_DIR.mkdir(parents=True, exist_ok=True)
+    """Precompute and save codebooks for common configurations.
+
+    Args:
+        dims: head dimensions to precompute.
+        bits_range: bit-widths to precompute.
+        target_dir: where to write the .npz files. Defaults to the user
+            cache directory (`~/.cache/mlx_turboquant/`, overridable via
+            ``$XDG_CACHE_HOME`` or ``$MLX_TURBOQUANT_CACHE``). Pass
+            ``CODEBOOK_DIR`` explicitly for the maintainer workflow that
+            seeds shipped codebooks into the package source tree.
+    """
+    out_dir = target_dir if target_dir is not None else _user_cache_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
     for d in dims:
         for b in bits_range:
-            npz_path = CODEBOOK_DIR / f"codebook_d{d}_b{b}.npz"
+            npz_path = out_dir / f"codebook_d{d}_b{b}.npz"
             if not npz_path.exists():
                 centroids, boundaries = lloyd_max(d, b)
                 np.savez(npz_path, centroids=centroids, boundaries=boundaries)
