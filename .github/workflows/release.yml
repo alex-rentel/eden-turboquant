@@ -1,0 +1,95 @@
+name: release
+
+# Triggered manually via workflow_dispatch OR automatically on a tag push
+# matching v*.*.*. Builds sdist + wheel, runs the unit suite as a final
+# sanity check, then creates a draft GitHub Release with the artifacts.
+# PyPI upload stays manual (irreversible per-version).
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release from (e.g. v1.0.4)"
+        required: true
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build-and-release:
+    name: Build wheel + sdist and create draft Release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Inputs / refs flow through actions/checkout's own input handling,
+          # not into run: shell commands, so this is safe.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install build
+
+      - name: Final unit suite (sanity check)
+        run: python -m pytest tests/ -q --ignore=tests/test_integration.py
+
+      - name: Build sdist and wheel
+        run: |
+          rm -rf dist/ build/ ./*.egg-info
+          python -m build
+
+      - name: Resolve tag name
+        id: tag
+        env:
+          # Pull untrusted inputs through env: so they cannot be interpreted
+          # as shell. Per GitHub Actions hardening guide.
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            echo "name=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract changelog block for release notes
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: |
+          # Strip the leading "v" since CHANGELOG headers use [1.0.3] not [v1.0.3].
+          version="${TAG_NAME#v}"
+          awk -v ver="$version" '
+            /^## \[/ {
+              if (in_block) exit
+              if ($0 ~ "\\[" ver "\\]") { in_block = 1; print; next }
+            }
+            in_block { print }
+          ' CHANGELOG.md > /tmp/release_notes.md
+          if [ ! -s /tmp/release_notes.md ]; then
+            echo "No CHANGELOG section for [$version]; using minimal notes." >&2
+            echo "Release $TAG_NAME" > /tmp/release_notes.md
+          fi
+          echo "First 5 lines of release notes:" >&2
+          head -n 5 /tmp/release_notes.md >&2
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.tag.outputs.name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --draft \
+            --title "$TAG_NAME" \
+            --notes-file /tmp/release_notes.md \
+            dist/*.tar.gz dist/*.whl
