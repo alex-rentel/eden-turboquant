@@ -61,7 +61,7 @@ Test: A/B decode tok/s, median of 3 runs, 1 warmup, 30 decode tokens per run, K4
 
 ## Why it's slower (the honest post-mortem)
 
-The v0.7.0 micro-benchmark at `BENCHMARKS_v07.md` measured `fused_qk_scores` vs `metal_dequantize + matmul` and reported a 2.12× speedup. That measurement was technically correct but **not the right comparison for the real hot path**.
+The v0.7.0 micro-benchmark at `BENCHMARKS_FUSED_QK.md` measured `fused_qk_scores` vs `metal_dequantize + matmul` and reported a 2.12× speedup. That measurement was technically correct but **not the right comparison for the real hot path**.
 
 In the actual decode loop, the standard path does:
 

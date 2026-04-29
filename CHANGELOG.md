@@ -127,7 +127,7 @@ tagged as a release.)
     - decode T_kv=1024 D=256 (Gemma3-like): **2.03×** speedup
     - decode T_kv=1024 D=128: 1.42× speedup
     - prefill is roughly tied (dispatch-bound regime)
-  - Full benchmark methodology in `BENCHMARKS_v07.md`.
+  - Full benchmark methodology in `docs/BENCHMARKS_FUSED_QK.md`.
   - Correctness guarantee: identical to dequant+matmul to atol=1e-3 on
     random inputs across all tested shapes. 12 tests in
     `TestFusedQKScoresCorrectness{4,3,2}Bit`.
@@ -162,7 +162,7 @@ tagged as a release.)
 - **`benchmarks/micro_fused_qk.py`** — go/no-go micro-benchmark that
   times the fused path against dequant+matmul on 7 realistic shapes.
 
-- **`BENCHMARKS_v07.md`** — full speedup numbers, kernel architecture
+- **`docs/BENCHMARKS_FUSED_QK.md`** — full speedup numbers, kernel architecture
   notes, and the honest "what isn't shipped in v0.7.0" section.
 
 ### Not in v0.7.0 (deferred to v0.8.0)
@@ -173,7 +173,7 @@ tagged as a release.)
   dense FP16 tensors that feed into standard
   `mx.fast.scaled_dot_product_attention`. Users who want the speedup
   today must call the kernels manually in a custom attention loop —
-  see the integration pathway in `BENCHMARKS_v07.md`.
+  see the integration pathway in `docs/BENCHMARKS_FUSED_QK.md`.
 - **Fusing V.** The current work covers only the Q @ K^T side of
   attention; the softmax-weighted V accumulation still uses dequantized
   V. Fusing V requires either a two-pass kernel or online softmax.

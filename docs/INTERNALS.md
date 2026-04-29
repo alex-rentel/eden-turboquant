@@ -41,7 +41,7 @@ On M1 Max 64GB, median of 30 trials:
 | T_kv=4096, D=128 | 487 μs | 230 μs | **2.12×** |
 | T_kv=1024, D=256 (Gemma) | 491 μs | 242 μs | **2.03×** |
 
-Full methodology in [BENCHMARKS_v07.md](../BENCHMARKS_v07.md).
+Full methodology in [BENCHMARKS_FUSED_QK.md](BENCHMARKS_FUSED_QK.md).
 
 ### Integration attempt #1 — decomposed SDPA (v0.8.0)
 
