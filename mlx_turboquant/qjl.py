@@ -92,39 +92,3 @@ def qjl_dequantize(signs: mx.array, norms: mx.array, projection: mx.array, d: in
     scale = (math.sqrt(math.pi / 2) / d) * norms[..., None]  # (..., 1)
 
     return scale * reconstructed
-
-
-def qjl_inner_product(
-    query: mx.array,
-    signs: mx.array,
-    norms: mx.array,
-    projection: mx.array,
-    d: int,
-) -> mx.array:
-    """Estimate inner product ⟨q, r⟩ using QJL without full dequantization.
-
-    ⟨q, r⟩ ≈ (√(π/2) / d) · γ · ⟨S·q, z⟩
-
-    Args:
-        query: Query vectors (..., d)
-        signs: QJL sign bits (..., m) as boolean
-        norms: Residual norms (...)
-        projection: Projection matrix (m, d) with N(0,1) entries
-        d: Original dimension
-
-    Returns:
-        Estimated inner products (...)
-    """
-    # Project query: (..., d) @ (d, m) -> (..., m)
-    q_proj = query @ projection.T  # (..., m)
-
-    # Convert signs to ±1
-    z = mx.where(signs, mx.array(1.0), mx.array(-1.0))  # (..., m)
-
-    # Dot product in projection space
-    dot = mx.sum(q_proj * z, axis=-1)  # (...)
-
-    # Scale: (√(π/2) / d) · γ
-    scale = (math.sqrt(math.pi / 2) / d) * norms
-
-    return scale * dot
