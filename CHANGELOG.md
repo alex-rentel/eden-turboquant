@@ -2,6 +2,98 @@
 
 All notable changes to mlx-turboquant.
 
+## [1.0.2] — 2026-04-29
+
+Patch release. Continued post-v1.0 polish — model-compatibility fix,
+test depth, dead-weight removal, contributor guard rails. No
+algorithmic changes; runtime is statistically tied with v1.0.1
+(n=40 trials, all deltas inside one standard deviation).
+
+### Added
+
+- **Sliding-window-attention auto-skip in `apply_turboquant`.**
+  TurboQuantKVCache cannot produce a windowed attention mask, so its
+  `make_mask` raises `NotImplementedError` on `window_size`. Models
+  with SWA layers (Mistral, newer Qwen, Gemma2's local layers, etc.)
+  would have hit that hole. `apply_turboquant` now probes the model's
+  default cache types at apply time, identifies layers whose default
+  is a `RotatingKVCache`-family cache, and routes those layers to the
+  model's preferred cache while still compressing the rest. Mirrors
+  the existing hybrid linear-attention detection. New test
+  `test_sliding_window_attention_layers_skipped`.
+- **Python 3.13 in CI matrix and pyproject classifiers.** Verified
+  locally on a fresh 3.13.12 venv with mlx 0.31.2: full unit suite
+  green.
+- **Fused-SDPA tripwire** (`test_cache_exposes_no_v08_fused_sdpa_hooks`).
+  The v0.8.0 fused-SDPA branch produced bit-identical correctness
+  but lost on speed (0.61x-0.99x vs the standard SDPA path); a guard
+  on `cache.py` now points future contributors at
+  `docs/FUSED_SDPA_RESULTS.md` before they reattempt the integration.
+
+### Fixed
+
+- **`precompute_codebooks` write path.** Same root cause as the
+  `get_codebook` fix shipped in v1.0.1 — the function unconditionally
+  wrote `.npz` files into the package source dir, causing
+  `PermissionError` on pip-installed wheels. Now defaults to the user
+  cache (`~/.cache/mlx_turboquant/`) with an optional `target_dir`
+  for the maintainer-prep workflow.
+- **`cli.py` mlx-lm load() return narrowed.** `load()` returns either
+  a 2-tuple or 3-tuple depending on version; the direct unpack
+  produced a persistent pyright warning. Indexed slots explicitly.
+  Pyright now sits at 0 errors / 0 warnings (was 0 / 1).
+
+### Performance
+
+- **Removed defensive `mx.array(...)` wrap in `_drain_chunk`.** Older
+  MLX versions had a lazy-graph bug that required the LHS / RHS slice
+  shift to materialize through a fresh allocation; under MLX 0.31+
+  the in-place semantics are correct. Drops three lines of dead
+  defensive code. Verified by full chunked-compression and
+  state-roundtrip suite plus a multi-chunk drain quality probe
+  (1984 tokens compressed across many cycles, mean key cos sim
+  0.9940).
+- **`_quant_4bit_pack_kernel` shared-memory rewrite.** Closes the
+  v0.6.0 CHANGELOG-deferred TODO. The original kernel recomputed
+  `inp[row*D + k] * inv_norm` inside every per-byte rotation loop,
+  giving O(D^2) global loads per row. New 2D-grid layout has one
+  threadgroup per row; threads cooperatively pre-normalize the input
+  into `threadgroup float shared_x[D]`, then read from shared memory
+  for all D output rotations. Drops global loads to O(D) per row.
+- **Decision NOT to wire the kernel into the production hot path.**
+  Microbenchmark on M1 Max 64GB / mlx 0.31.1 (n=30, 5 warmup) shows
+  the kernel beats the pure-MLX rotate+quantize_scalar+pack pipeline
+  only at small batches (N <= 512); MLX wins decisively for any
+  realistic LLM batch (any model with H >= 16 or T >= 128 sits in
+  MLX-wins territory). Full table in `kernels.py` docstring. The
+  kernel stays unwired but tested, available for future research.
+
+### Tests
+
+- **Parameterized round-trip coverage for `state.setter` legacy paths**
+  (6/8/10-element tuples). Pre-v0.6.0, v0.6.0 pre-fractional, and
+  current state shapes are now exercised against realistic state, not
+  just `None` placeholders. Added 11 parameterized cases.
+- **Kernel correctness tests for `metal_quantize_4bit`.** Round-trip
+  cos-sim parameterized over D in {64, 96, 128, 256}, norms-vs-numpy
+  reference equality, output shape contract.
+
+### Repo housekeeping
+
+- `tests/REAL_MODEL_RESULTS.md` moved to `docs/REAL_MODEL_RESULTS.md`
+  (no internal references; tests/ is an odd home for a results log).
+- `pyrightconfig.json` consolidated into `[tool.pyright]` in
+  `pyproject.toml` — single source of truth for tool config.
+- README requirements line updated to mention 3.10-3.13 support and
+  carry a "Last validated" footer.
+
+### Test counts
+
+- v1.0.1 shipped at 185 passing.
+- v1.0.2: **206 passing** (+21: SWA detection +1, state.setter
+  parameterized round-trip +11, kernel correctness +6, codebook cache
+  paths +2, fused-SDPA tripwire +1).
+
 ## [1.0.1] — 2026-04-29
 
 Patch release. Post-v1.0.0 review polish — bug fixes and tooling. No
