@@ -1,0 +1,40 @@
+version: 2
+
+updates:
+  # Python dependencies declared in pyproject.toml.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Detroit
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+    # Group runtime deps and dev deps separately so we don't open six PRs
+    # for one weekly update wave.
+    groups:
+      runtime:
+        patterns:
+          - mlx
+          - mlx-lm
+          - numpy
+      dev:
+        patterns:
+          - pytest*
+          - ruff
+          - pyright
+          - scipy
+          - psutil
+
+  # GitHub Actions versions in .github/workflows/.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - github-actions
