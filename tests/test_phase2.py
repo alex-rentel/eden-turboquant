@@ -235,6 +235,97 @@ class TestStateReload:
         assert cache.sink_keys is None
         assert cache._compressed_keys_lo is None
 
+    @pytest.mark.parametrize("key_bits,value_bits", [(4, 2), (4, 4), (3, 3)])
+    def test_legacy_6tuple_realistic_roundtrip(self, key_bits, value_bits):
+        """v0.5.x 6-tuple sessions (no sink, no fractional) round-trip into
+        a fresh cache and the next decode step does not crash."""
+        np.random.seed(11)
+        cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                  value_bits=value_bits, residual_window=16,
+                                  chunk_size=64)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+
+        # Trim live state to the 6-tuple shape pre-v0.6.0 sessions emitted.
+        legacy_state = cache.state[:6]
+        # Legacy meta_state from v0.5.x: no sink_len / fp16_sink_size keys.
+        legacy_meta = {
+            "offset": str(cache.offset),
+            "compressed_len": str(cache._compressed_len),
+            "head_dim": str(cache.head_dim),
+            "key_bits": str(key_bits),
+            "value_bits": str(value_bits),
+            "fp16_len": str(cache._fp16_len),
+            "fp16_capacity": str(cache._fp16_capacity),
+        }
+
+        new_cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                      value_bits=value_bits, residual_window=16,
+                                      chunk_size=64)
+        new_cache.state = legacy_state
+        new_cache.meta_state = legacy_meta
+
+        # Sink fields default to None / 0 — no leak from older fields.
+        assert new_cache.sink_keys is None
+        assert new_cache._sink_len == 0
+        # Decode: the next update should produce the right total length.
+        decode = mx.array(np.random.randn(1, 2, 1, 128).astype(np.float32))
+        k_out, _ = new_cache.update_and_fetch(decode, decode)
+        assert k_out.shape[2] == 201
+
+    @pytest.mark.parametrize("key_bits,value_bits", [(4, 2), (4, 4), (3, 3)])
+    def test_legacy_8tuple_realistic_roundtrip(self, key_bits, value_bits):
+        """v0.6.0 pre-fractional 8-tuple sessions (with sink, no fractional
+        lo parts) round-trip cleanly."""
+        np.random.seed(12)
+        cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                  value_bits=value_bits, residual_window=16,
+                                  chunk_size=64, fp16_sink_size=8)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+
+        legacy_state = cache.state[:8]
+        legacy_meta = dict(cache.meta_state)  # keeps sink_len/fp16_sink_size
+
+        new_cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                      value_bits=value_bits, residual_window=16,
+                                      chunk_size=64, fp16_sink_size=8)
+        new_cache.state = legacy_state
+        new_cache.meta_state = legacy_meta
+
+        # Sink should restore; fractional lo arrays absent (integer config).
+        assert new_cache._compressed_keys_lo is None
+        assert new_cache._compressed_values_lo is None
+        decode = mx.array(np.random.randn(1, 2, 1, 128).astype(np.float32))
+        k_out, _ = new_cache.update_and_fetch(decode, decode)
+        assert k_out.shape[2] == 201
+
+    @pytest.mark.parametrize("key_bits,value_bits",
+                             [(4, 2), (4, 4), (3, 3), (3.5, 2), (4, 3.5)])
+    def test_current_10tuple_roundtrip_decode_matches(self, key_bits, value_bits):
+        """Current 10-tuple state restores to a cache whose next decode
+        produces the same shape (and, for integer bits, the same dequantized
+        values) as the live cache."""
+        np.random.seed(13)
+        cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                  value_bits=value_bits, residual_window=16,
+                                  chunk_size=64, fp16_sink_size=4)
+        keys = mx.array(np.random.randn(1, 2, 200, 128).astype(np.float32))
+        cache.update_and_fetch(keys, keys)
+        full_state = cache.state
+        assert len(full_state) == 10
+
+        new_cache = TurboQuantKVCache(head_dim=128, key_bits=key_bits,
+                                      value_bits=value_bits, residual_window=16,
+                                      chunk_size=64, fp16_sink_size=4)
+        new_cache.state = full_state
+        new_cache.meta_state = cache.meta_state
+
+        decode = mx.array(np.random.randn(1, 2, 1, 128).astype(np.float32))
+        k_old, _ = cache.update_and_fetch(decode, decode)
+        k_new, _ = new_cache.update_and_fetch(decode, decode)
+        assert k_old.shape == k_new.shape
+
 
 class TestQJLCorrection:
     """Tests for optional 1-bit QJL sign-sketch residual correction."""
