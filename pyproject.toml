@@ -84,3 +84,22 @@ ignore = [
     "E501",  # line length handled by formatter / not always actionable for math-heavy code
     "B008",  # default-arg function calls (mx.array(...) defaults are intentional in our API)
 ]
+
+[tool.pyright]
+include = ["mlx_turboquant"]
+exclude = ["**/__pycache__", "build", "dist"]
+typeCheckingMode = "basic"
+pythonVersion = "3.10"
+pythonPlatform = "Darwin"
+# cache.py uses runtime length-guards (`_compressed_len > 0`) that pyright
+# cannot see; rather than refactor the whole file to narrow Optional fields,
+# turn off the noisy Optional-narrowing rules and keep the high-signal ones
+# (reportArgumentType — caught the int/float annotation bug pre-v1.0.1).
+reportOptionalSubscript = "none"
+reportOptionalMemberAccess = "none"
+reportOptionalCall = "none"
+reportOptionalOperand = "none"
+reportOptionalIterable = "none"
+reportCallIssue = "none"
+reportAssignmentType = "warning"
+reportArgumentType = "error"
